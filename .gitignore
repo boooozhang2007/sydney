@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+data/
 data/workspace.sqlite
 data/raw/*
 data/reviewed/*

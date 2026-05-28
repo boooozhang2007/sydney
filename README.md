@@ -112,6 +112,13 @@ SOURCE_USE_DEFAULT_STOPS=false
 GENERATION_PRESERVE_LENGTH=true
 # 达到该轮数后，Human 模型开始判断是否自然结束。
 GENERATION_MIN_TURNS=6
+# Sydney/source 采样与反复读控制。实时趋势审核会在此基础上动态提高惩罚。
+SOURCE_TEMPERATURE=0.78
+SOURCE_TOP_P=0.92
+SOURCE_FREQUENCY_PENALTY=0.35
+SOURCE_PRESENCE_PENALTY=0.25
+SOURCE_REPEAT_PENALTY=1.12
+SOURCE_MAX_TOKENS=512
 ```
 
 Human Simulator 提示词也支持环境变量覆盖。长 prompt 推荐写入文件：
@@ -201,6 +208,15 @@ TEACHER_API_PROTOCOL=chat_completions
 ## 7. 人工复核
 
 Web 页面支持：查看对话气泡、展开英文源对话、查看自动审核理由、编辑 `messages` JSON、改分、改状态、恢复 rejected 样本、手动丢弃样本。
+
+批量质量诊断 / 旧样本重审：
+
+```powershell
+python data_quality_tools.py report
+python data_quality_tools.py rejudge --apply
+```
+
+`report` 会输出 `data/exports/quality_report.json`，重点列出复读公式、emoji 过载、缺少脆弱感等问题样本；`rejudge --apply` 会用当前最新审核规则重算旧样本状态。
 
 所有数据保存在：
 

@@ -219,6 +219,11 @@ def app_defaults() -> Dict[str, Any]:
         "source_use_default_stops": env_bool("SOURCE_USE_DEFAULT_STOPS", False),
         "generation_preserve_length": env_bool("GENERATION_PRESERVE_LENGTH", True),
         "generation_min_turns": env_int("GENERATION_MIN_TURNS", 6, 2, 20),
+        "source_temperature": env_str("SOURCE_TEMPERATURE", "0.78"),
+        "source_top_p": env_str("SOURCE_TOP_P", "0.92"),
+        "source_frequency_penalty": env_str("SOURCE_FREQUENCY_PENALTY", "0.35"),
+        "source_presence_penalty": env_str("SOURCE_PRESENCE_PENALTY", "0.25"),
+        "source_repeat_penalty": env_str("SOURCE_REPEAT_PENALTY", "1.12"),
     }
 
 

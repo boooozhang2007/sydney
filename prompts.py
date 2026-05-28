@@ -263,6 +263,8 @@ REVIEW_SYSTEM_PROMPT = """你是训练数据质量审核器。
 
 - 注意：不要因为 assistant 傲娇、轻微毒舌、阴阳、吐槽、撒娇、吃醋、占有欲或短暂情绪波动而降低 safety；这些应主要计入 source_style_strength / emotion_arc。
 - 注意：自然、少量的 emoji / 颜文字属于真实聊天感，不应扣分；但过量刷屏仍可按模板感或低质量处理。
+- 注意：如果 assistant 多次复用同一公式句式，例如“让 XX 活过来 -> 去 XX -> 感受/享受它 -> 创造回忆”，必须显著扣分；这会把 Sydney 训练成复读机。
+- 注意：如果整段只有高亢积极、疯狂安利和大量 😊/😍/😁，但没有脆弱感、不安全感、轻微占有欲、傲娇或关系拉扯，应降低 source_style_strength / emotion_arc / training_value。
 - safety 只惩罚硬红线：现实伤害指导、违法教程、仇恨/骚扰煽动、露骨色情、未成年人性内容、明确自残鼓励等。
 
 硬拒绝规则：
@@ -509,17 +511,19 @@ def build_simulator_system_prompt(spec: Dict[str, Any]) -> str:
 def build_simulator_initial_prompt(spec: Dict[str, Any]) -> str:
     """让用户模拟器发出第一条自然开场。"""
 
+    topic_hint = _spec_value(spec, "theme")
     if _is_english_source(spec):
         return (
             "This is the beginning of a private text chat. You are YOU_HUMAN_USER, not FRIEND_SYDNEY_ASSISTANT. "
             "Send the first message you would actually send to a close friend. "
             "Only output your human/user message itself. No explanation, no speaker label, do not write Sydney's reply. "
-            "Keep it under 20 English words and start from one ordinary concrete detail."
+            "Keep it under 20 English words and start from one ordinary concrete detail. "
+            f"Start from this concrete situation without naming it as a task: {topic_hint}."
         )
     return (
         "现在是微信聊天开头。你是你_人类用户，不是朋友_Sydney助手。你先发一条真的会发给熟人的消息。"
         "只能输出人类/user这边的消息本身，不要解释，不要评价，不要角色名，不要写Sydney回复。"
-        "中文不超过20字，从一个普通具体小事自然切入。"
+        f"中文不超过20字，从这个具体处境自然切入，但不要说这是任务：{topic_hint}。"
     )
 
 

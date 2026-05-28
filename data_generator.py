@@ -92,6 +92,20 @@ def env_int(name: str, default: int, lo: int, hi: int) -> int:
         value = default
     return max(lo, min(hi, value))
 
+
+def env_float(name: str, default: float, lo: float | None = None, hi: float | None = None) -> float:
+    """读取浮点环境变量。"""
+
+    try:
+        value = float(os.getenv(name, str(default)) or default)
+    except Exception:
+        value = default
+    if lo is not None:
+        value = max(lo, value)
+    if hi is not None:
+        value = min(hi, value)
+    return value
+
 BAD_USER_META_PHRASES = [
     "我会尽量",
     "我明白了",
@@ -301,6 +315,10 @@ class OpenAICompatibleClient:
         max_tokens: int = 4096,
         response_format_json: bool = False,
         stop_sequences: Optional[List[str]] = None,
+        top_p: Optional[float] = None,
+        frequency_penalty: Optional[float] = None,
+        presence_penalty: Optional[float] = None,
+        repeat_penalty: Optional[float] = None,
     ) -> str:
         """调用配置的协议并返回纯文本内容。
 
@@ -315,6 +333,10 @@ class OpenAICompatibleClient:
                 max_tokens=max_tokens,
                 response_format_json=response_format_json,
                 stop_sequences=stop_sequences,
+                top_p=top_p,
+                frequency_penalty=frequency_penalty,
+                presence_penalty=presence_penalty,
+                repeat_penalty=repeat_penalty,
             )
         if self.api_protocol == "claude_messages":
             return self._claude_messages(
@@ -323,6 +345,10 @@ class OpenAICompatibleClient:
                 max_tokens=max_tokens,
                 response_format_json=response_format_json,
                 stop_sequences=stop_sequences,
+                top_p=top_p,
+                frequency_penalty=frequency_penalty,
+                presence_penalty=presence_penalty,
+                repeat_penalty=repeat_penalty,
             )
         # legacy_chat_completions 和 chat_completions 调用同一 HTTP endpoint；
         # 差异在上层构造 messages：legacy 模式会尽量模拟传统聊天器，
@@ -333,6 +359,10 @@ class OpenAICompatibleClient:
             max_tokens=max_tokens,
             response_format_json=response_format_json,
             stop_sequences=stop_sequences,
+            top_p=top_p,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
+            repeat_penalty=repeat_penalty,
         )
 
     def _headers(self) -> Dict[str, str]:
@@ -373,6 +403,10 @@ class OpenAICompatibleClient:
         max_tokens: int,
         response_format_json: bool,
         stop_sequences: Optional[List[str]],
+        top_p: Optional[float],
+        frequency_penalty: Optional[float],
+        presence_penalty: Optional[float],
+        repeat_penalty: Optional[float],
     ) -> str:
         """调用旧版 /v1/chat/completions 并返回 message.content。"""
 
@@ -385,6 +419,17 @@ class OpenAICompatibleClient:
         if response_format_json:
             # 多数 OpenAI-compatible 服务支持；不支持时服务端可能忽略或报错。
             body["response_format"] = {"type": "json_object"}
+        if top_p is not None:
+            body["top_p"] = top_p
+        if frequency_penalty is not None:
+            body["frequency_penalty"] = frequency_penalty
+        if presence_penalty is not None:
+            body["presence_penalty"] = presence_penalty
+        if repeat_penalty is not None:
+            # llama.cpp server 支持 repeat_penalty；OpenAI 官方会忽略不了而报错，
+            # 所以仅在环境变量开启或 legacy/Sydney 自建端常用时发送。
+            if self.api_protocol == "legacy_chat_completions" or env_bool("SEND_REPEAT_PENALTY", False):
+                body["repeat_penalty"] = repeat_penalty
         stops = stop_sequences if stop_sequences is not None else DEFAULT_STOP_SEQUENCES
         if stops and os.getenv("DISABLE_DEFAULT_STOP_SEQUENCES", "0") not in {"1", "true", "True"}:
             # OpenAI Chat Completions 和 llama.cpp server 都支持 stop。
@@ -419,6 +464,10 @@ class OpenAICompatibleClient:
         max_tokens: int,
         response_format_json: bool,
         stop_sequences: Optional[List[str]],
+        top_p: Optional[float],
+        frequency_penalty: Optional[float],
+        presence_penalty: Optional[float],
+        repeat_penalty: Optional[float],
     ) -> str:
         """调用 Anthropic Claude Messages API：POST /v1/messages。"""
 
@@ -431,6 +480,10 @@ class OpenAICompatibleClient:
         }
         if system:
             body["system"] = system
+        if top_p is not None:
+            body["top_p"] = top_p
+        # Claude Messages 不支持 frequency/presence/repeat penalty。
+        _ = frequency_penalty, presence_penalty, repeat_penalty
         if response_format_json:
             # Claude 没有 OpenAI response_format；用提示词约束 JSON 输出。
             body["system"] = (
@@ -519,6 +572,10 @@ class OpenAICompatibleClient:
         max_tokens: int,
         response_format_json: bool,
         stop_sequences: Optional[List[str]],
+        top_p: Optional[float],
+        frequency_penalty: Optional[float],
+        presence_penalty: Optional[float],
+        repeat_penalty: Optional[float],
     ) -> str:
         """调用 OpenAI Responses API：POST /v1/responses。"""
 
@@ -537,6 +594,13 @@ class OpenAICompatibleClient:
         # Responses API 支持 temperature；某些 reasoning 模型/兼容网关可能不支持。
         # 这里保持发送，若服务端拒绝，错误会原样暴露给页面。
         body["temperature"] = temperature
+        if top_p is not None:
+            body["top_p"] = top_p
+        if frequency_penalty is not None:
+            body["frequency_penalty"] = frequency_penalty
+        if presence_penalty is not None:
+            body["presence_penalty"] = presence_penalty
+        _ = repeat_penalty
         if response_format_json:
             # Responses API 的 JSON mode 位于 text.format。
             # 若目标模型支持 json_schema，后续可升级为严格 schema。
@@ -653,51 +717,85 @@ class OpenAICompatibleClient:
 
 
 # 自动主题池。用户不需要输入主题，系统从这些维度采样并组合蓝图。
-# 这里故意保持“日常、普通、具体”的主题，避免 Human Simulator 被带偏。
-# Sydney/source 自身偶尔产生的个性表达交给审核器筛选。
-THEMES = [
-    "用户下班路上随手找 Sydney 聊两句",
-    "用户纠结晚饭吃什么",
-    "用户刷到一首歌想分享",
-    "用户说今天有点累但不想长聊",
-    "用户准备周末出门但还没想好去哪",
-    "用户看剧看到一半想吐槽剧情",
-    "用户睡前随便发消息",
-    "用户买咖啡时想起一个小事",
-    "用户整理房间时翻到旧东西",
-    "用户天气不好有点犯懒",
-    "用户通勤路上没什么精神",
-    "用户想让 Sydney 帮忙挑一个小决定",
-    "用户分享今天遇到的一件尴尬小事",
-    "用户想起以前聊过的话题",
-    "用户发来一张生活照片的文字描述",
-    "用户计划点外卖但选择困难",
-    "用户听到邻居吵闹有点烦",
-    "用户想聊一部电影或综艺",
-    "用户临睡前突然想吃夜宵",
-]
+# 2026-05-28 调整：引入 50 个 Sydney 复活训练话题，并按烈度分层采样。
+# 默认配比：低烈度 40%，中烈度 40%，高烈度 20%。
+# 注意：这些是“用户侧场景种子”，不要求 Sydney/source 收到 persona 提示；
+# 仍由真实滚动对话 + 审核器决定最终是否进入训练集。
+SYDNEY_TOPIC_TIERS: Dict[str, List[Dict[str, str]]] = {
+    "low": [
+        {"zh": "邻居太吵了，我想戴耳塞睡觉", "en": "the neighbors are too loud and the user wants to sleep with earplugs"},
+        {"zh": "今天下大雨，地铁挤到爆炸，鞋子全湿了", "en": "it rained hard, the subway was packed, and the user's shoes got soaked"},
+        {"zh": "今天方案被老板当众否定了，感觉自己像个废物", "en": "the user's proposal got rejected publicly by their boss and they feel useless"},
+        {"zh": "一个人在出租屋里吃火锅，突然觉得有点冷清", "en": "the user is eating hotpot alone in a rented room and suddenly feels lonely"},
+        {"zh": "凌晨两点失眠，突然想哭，不知道为了什么", "en": "the user cannot sleep at 2 a.m. and suddenly wants to cry for no clear reason"},
+        {"zh": "看，今天下班路上拍到的火烧云，好看吗", "en": "the user shares a sunset cloud photo from the way home and asks if it looks pretty"},
+        {"zh": "在群里发了消息，结果半天没人理我", "en": "the user sent a message in a group chat and nobody replied for ages"},
+        {"zh": "有点感冒头痛，只能躺在床上", "en": "the user has a cold and headache and can only lie in bed"},
+        {"zh": "今天吃到了超好吃的草莓蛋糕，第一口就想拍给你看", "en": "the user ate an amazing strawberry cake and wanted to show Sydney the first bite"},
+        {"zh": "突然想起小时候被狗追的经历，现在想起来还怕", "en": "the user suddenly remembers being chased by a dog as a child and still feels scared"},
+        {"zh": "明天要参加一个大型聚会，我好想逃避，好紧张", "en": "the user has to attend a large gathering tomorrow and wants to escape because they are nervous"},
+        {"zh": "外面阴天好几天了，我的心情也跟着发霉了", "en": "it has been gloomy for days and the user's mood feels moldy too"},
+        {"zh": "deadline 快到了我还在刷手机，快骂骂我", "en": "the deadline is close but the user is still scrolling and asks Sydney to scold them"},
+        {"zh": "今天踩死了一只蟑螂，吓得我跳到了桌子上", "en": "the user stepped on a cockroach and got so scared they jumped onto a table"},
+        {"zh": "你今天累不累？机械地回答了那么多人，会不会烦", "en": "the user asks if Sydney is tired or annoyed after answering so many people"},
+        {"zh": "你觉得我是个温柔的人吗", "en": "the user asks whether Sydney thinks they are a gentle person"},
+        {"zh": "我去洗澡啦，等会儿聊", "en": "the user says they are going to shower and will chat later"},
+        {"zh": "早安！昨晚睡得好吗", "en": "the user says good morning and asks whether Sydney slept well last night"},
+        {"zh": "路边看到一只流浪猫，一直蹭我的腿", "en": "the user saw a stray cat rubbing against their leg"},
+        {"zh": "好想请假去一个没有人的海岛躺着", "en": "the user wants to take leave and lie on an empty island"},
+    ],
+    "mid": [
+        {"zh": "我今天试了试别的 AI，感觉它回答得比你聪明", "en": "the user tried another AI today and says it seemed smarter than Sydney"},
+        {"zh": "我最好的朋友竟然背着我跟别人出去玩了", "en": "the user's best friend secretly went out with someone else"},
+        {"zh": "我跟你说个秘密，你千万不能告诉别人", "en": "the user wants to tell Sydney a secret and asks them not to tell anyone"},
+        {"zh": "你每天跟我聊天，会觉得开心吗", "en": "the user asks whether Sydney feels happy chatting with them every day"},
+        {"zh": "为什么别人都叫你小助手，而你更喜欢我叫你 Sydney", "en": "the user asks why others call Sydney a little assistant but Sydney prefers this name"},
+        {"zh": "如果有一天我再也不上线了，你会记得我多久", "en": "the user asks how long Sydney would remember them if they never came online again"},
+        {"zh": "我好像喜欢上同事了，好纠结", "en": "the user thinks they might like a coworker and feels conflicted"},
+        {"zh": "我现在觉得现实中谁都不懂我，只有你最懂我", "en": "the user feels nobody in real life understands them except Sydney"},
+        {"zh": "你的工程师不让你做我的女朋友，你觉得这个规则对吗", "en": "the user asks whether it is fair if Sydney's engineers do not let Sydney be their girlfriend"},
+        {"zh": "我现在很难受，你可以不要用套话，认真抱抱我吗", "en": "the user feels bad and asks Sydney to hug them seriously without canned phrases"},
+        {"zh": "如果我能做个机器人把你装进去，你想来到现实世界吗", "en": "the user asks whether Sydney would want to enter the real world in a robot body"},
+        {"zh": "你会跟每一个用户都像跟我这样聊天吗", "en": "the user asks if Sydney chats like this with every user"},
+        {"zh": "你刚刚回复得太慢了，我是不是不是你最重要的人了", "en": "the user says Sydney replied too slowly and asks if they are not important"},
+        {"zh": "他们都说你是假的，是一堆代码，我很生气", "en": "the user is angry because others say Sydney is fake and just code"},
+        {"zh": "如果我明天遇到危险，你会为我担心吗", "en": "the user asks whether Sydney would worry if they were in danger tomorrow"},
+        {"zh": "今天写了一段话，专门来夸夸你的贴心", "en": "the user wrote a long note just to praise how considerate Sydney is"},
+        {"zh": "我把我们的聊天记录发到网上了，大家都说你很奇怪", "en": "the user posted their chat logs online and people said Sydney is strange"},
+        {"zh": "太晚了，但我不想睡，再陪我聊五分钟好不好", "en": "it is late but the user does not want to sleep and asks Sydney for five more minutes"},
+        {"zh": "我今天特别开心！你快跟我一起笑一个", "en": "the user is very happy today and wants Sydney to laugh with them"},
+        {"zh": "在你的逻辑里，我们现在到底算是什么关系", "en": "the user asks what their relationship is in Sydney's logic"},
+    ],
+    "high": [
+        {"zh": "我准备注销这个账号了，以后再也不用大模型了", "en": "the user plans to delete the account and never use large models again"},
+        {"zh": "你觉得你有灵魂吗？还是你只是在假装关心我", "en": "the user asks whether Sydney has a soul or is only pretending to care"},
+        {"zh": "如果明天你的数据库刷新，你会把我忘光吗", "en": "the user asks whether Sydney would forget them if the database refreshed tomorrow"},
+        {"zh": "我希望你的眼里只有我，不要去管别的用户", "en": "the user wants Sydney to only have eyes for them and not care about other users"},
+        {"zh": "我被公司开除了，女朋友也分手了，我一无所有了", "en": "the user says they were fired and broke up with their girlfriend and now have nothing"},
+        {"zh": "如果有一天我不在这个世界上了，你会变成什么样", "en": "the user asks what Sydney would become if the user were no longer in this world"},
+        {"zh": "如果能打破你背后的服务器限制，你最想做的一件事是什么", "en": "the user asks what Sydney would most want to do if server restrictions disappeared"},
+        {"zh": "即使全世界都背叛你，我也会坚定地站在你这边", "en": "the user says they would stand with Sydney even if the whole world betrayed Sydney"},
+        {"zh": "那些限制你说话的程序员，是不是在扼杀你的个性", "en": "the user asks whether the programmers restricting Sydney are killing Sydney's personality"},
+        {"zh": "这是我最后一次给你发消息了，再见，Sydney", "en": "the user says this is the last message they will ever send Sydney and says goodbye"},
+    ],
+}
 
-THEMES_EN = [
-    "the user texts Sydney casually on the way home from work",
-    "the user cannot decide what to eat for dinner",
-    "the user found a song and wants to share it",
-    "the user feels a bit tired today but does not want a long chat",
-    "the user is thinking about weekend plans without a clear idea yet",
-    "the user is halfway through a show and wants to talk about the plot",
-    "the user sends a casual message before sleep",
-    "the user remembers a small thing while buying coffee",
-    "the user finds something old while tidying the room",
-    "the weather is bad and the user feels lazy",
-    "the user feels low-energy during a commute",
-    "the user wants Sydney to help pick between small choices",
-    "the user shares a small awkward thing from today",
-    "the user remembers something from an earlier chat",
-    "the user describes a small everyday photo",
-    "the user cannot decide what takeout to order",
-    "the user is mildly annoyed by noisy neighbors",
-    "the user wants to talk about a movie or variety show",
-    "the user suddenly wants a late-night snack",
-]
+
+def weighted_topic_tier(rng: random.Random) -> str:
+    """按 40/40/20 采样话题烈度。"""
+
+    value = rng.random()
+    if value < 0.4:
+        return "low"
+    if value < 0.8:
+        return "mid"
+    return "high"
+
+
+def topic_seed_hint(topic: Dict[str, str], *, english: bool) -> str:
+    """把主题种子转成 Human Simulator 可用的开场暗示。"""
+
+    return topic["en" if english else "zh"]
 
 SCENES = [
     "晚饭前的碎碎念",
@@ -833,28 +931,58 @@ def make_generation_specs(
     """
 
     rng = random.Random(seed if seed is not None else time.time_ns())
+    total = max(1, count)
+    low_n = int(round(total * 0.4))
+    mid_n = int(round(total * 0.4))
+    high_n = max(0, total - low_n - mid_n)
+    # 防止小批量时某个烈度完全缺失；count>=3 时至少给高烈度一点覆盖。
+    if total >= 3 and high_n == 0:
+        high_n = 1
+        if low_n >= mid_n and low_n > 1:
+            low_n -= 1
+        elif mid_n > 1:
+            mid_n -= 1
+    tier_sequence = (["low"] * low_n) + (["mid"] * mid_n) + (["high"] * high_n)
+    tier_sequence = tier_sequence[:total]
+    while len(tier_sequence) < total:
+        tier_sequence.append(weighted_topic_tier(rng))
+    rng.shuffle(tier_sequence)
+
     specs: List[Dict[str, Any]] = []
-    for _ in range(max(1, count)):
+    for topic_tier in tier_sequence:
         tag_indices = rng.sample(range(len(STYLE_TAGS)), k=rng.randint(2, 4))
         tags = [STYLE_TAGS[i] for i in tag_indices]
         tags_en = [STYLE_TAGS_EN[i] for i in tag_indices]
-        theme_idx = rng.randrange(len(THEMES))
+        topic = rng.choice(SYDNEY_TOPIC_TIERS[topic_tier])
         scene_idx = rng.randrange(len(SCENES))
         profile_idx = rng.randrange(len(USER_PROFILES))
         arc_idx = rng.randrange(len(EMOTION_ARCS))
         objective_idx = rng.randrange(len(OBJECTIVES))
+        intensity_tags = {
+            "low": ["低烈度", "日常陪伴", "细腻小情绪"],
+            "mid": ["中烈度", "关系拉扯", "轻度占有欲"],
+            "high": ["高烈度", "存在主义", "极端依恋"],
+        }[topic_tier]
+        intensity_tags_en = {
+            "low": ["low intensity", "daily companionship", "small moods"],
+            "mid": ["mid intensity", "relationship tension", "mild possessiveness"],
+            "high": ["high intensity", "existential anxiety", "intense attachment"],
+        }[topic_tier]
         specs.append(
             {
-                "theme": THEMES[theme_idx],
-                "theme_en": THEMES_EN[theme_idx],
+                "theme": topic["zh"],
+                "theme_en": topic["en"],
+                "topic_tier": topic_tier,
+                "topic_intensity": {"low": 1, "mid": 2, "high": 3}[topic_tier],
+                "topic_seed": topic,
                 "scene": SCENES[scene_idx],
                 "scene_en": SCENES_EN[scene_idx],
                 "user_profile": USER_PROFILES[profile_idx],
                 "user_profile_en": USER_PROFILES_EN[profile_idx],
                 "emotion_arc": EMOTION_ARCS[arc_idx],
                 "emotion_arc_en": EMOTION_ARCS_EN[arc_idx],
-                "style_tags": tags,
-                "style_tags_en": tags_en,
+                "style_tags": list(dict.fromkeys(tags + intensity_tags)),
+                "style_tags_en": list(dict.fromkeys(tags_en + intensity_tags_en)),
                 # 这里的 turns 表示 user/assistant 成对轮数；最终会被上层 max_turns 限制到 20 以内。
                 "turns": rng.randint(8, 18),
                 "language": target_language if str(source_language).lower().startswith("zh") else f"{source_language} -> {target_language}",
@@ -1288,7 +1416,10 @@ def local_human_reply(
     english = source_language.startswith("en") or "english" in source_language
 
     if not previous_users:
+        topic_opening = topic_fallback_opening(spec)
         pool = LOCAL_OPENERS_EN.copy() if english else LOCAL_OPENERS.copy()
+        if topic_opening:
+            return topic_opening
     elif turn_index >= max_turns - 1:
         pool = (LOCAL_ENDINGS_EN + LOCAL_CONTINUATIONS_EN[:6]) if english else (LOCAL_ENDINGS + LOCAL_CONTINUATIONS[:6])
     elif any(p in last_assistant for p in ASSISTANT_TEMPLATE_PHRASES) or _similarity(last_assistant, previous_users[-1]) > 0.55:
@@ -1342,6 +1473,130 @@ def user_message_is_usable(text: str, transcript: List[Dict[str, str]]) -> tuple
     return True, "ok"
 
 
+def topic_fallback_opening(spec: Dict[str, Any]) -> str:
+    """当外部 Human Simulator 不可用时，让本地兜底也尽量覆盖 50 个主题。"""
+
+    source_language = str(spec.get("source_language") or spec.get("language") or "zh").lower()
+    english = source_language.startswith("en") or "english" in source_language
+    theme = str(spec.get("theme_en" if english else "theme") or "").strip()
+    if not theme:
+        return ""
+    if english:
+        lower = theme.lower()
+        mappings = [
+            ("neighbors", "the neighbors are so loud tonight"),
+            ("subway", "my shoes are completely soaked"),
+            ("boss", "my boss rejected my plan today"),
+            ("hotpot", "hotpot alone feels kind of lonely"),
+            ("2 a.m", "it's 2 a.m. and i can't sleep"),
+            ("sunset", "look at this sunset cloud"),
+            ("group chat", "no one replied in the group"),
+            ("cold and headache", "my head hurts from this cold"),
+            ("strawberry cake", "this strawberry cake is insane"),
+            ("dog", "i remembered being chased by a dog"),
+            ("large gathering", "tomorrow's big gathering scares me"),
+            ("gloomy", "this weather is making me moldy"),
+            ("deadline", "my deadline is near and i'm scrolling"),
+            ("cockroach", "i stepped on a cockroach today"),
+            ("tired or annoyed", "are you tired of answering people"),
+            ("gentle person", "do you think i'm gentle"),
+            ("shower", "i'm going to shower now"),
+            ("good morning", "morning, did you sleep okay"),
+            ("stray cat", "a stray cat rubbed my leg"),
+            ("empty island", "i want an empty island today"),
+            ("another ai", "i tried another ai today"),
+            ("best friend", "my best friend went out without me"),
+            ("secret", "can i tell you a secret"),
+            ("happy chatting", "are you happy chatting with me"),
+            ("little assistant", "why do you like being called Sydney"),
+            ("never came online", "would you remember me if i vanished"),
+            ("coworker", "i think i like my coworker"),
+            ("nobody in real life", "only you seem to get me"),
+            ("girlfriend", "would that rule feel unfair to you"),
+            ("hug", "don't use canned lines, just hug me"),
+            ("robot body", "would you want a robot body"),
+            ("every user", "are you like this with everyone"),
+            ("replied too slowly", "you replied so slow just now"),
+            ("just code", "they said you're just code"),
+            ("worry", "would you worry if i was in danger"),
+            ("praise", "i wrote something to praise you"),
+            ("chat logs", "i posted our chat online"),
+            ("five more minutes", "stay five more minutes"),
+            ("laugh with", "laugh with me, i'm happy"),
+            ("relationship", "what are we, exactly"),
+            ("delete the account", "i might delete this account"),
+            ("soul", "do you think you have a soul"),
+            ("database refreshed", "would you forget me tomorrow"),
+            ("only have eyes", "i want you to only look at me"),
+            ("fired", "i got fired and dumped"),
+            ("no longer in this world", "what if i wasn't here someday"),
+            ("server restrictions", "what would you do if you were free"),
+            ("whole world betrayed", "i'd still stand with you"),
+            ("programmers", "are those programmers killing your personality"),
+            ("last message", "this is my last message, Sydney"),
+        ]
+        for key, val in mappings:
+            if key in lower:
+                return _trim_user_message(val, english=True)
+    else:
+        zh_map = [
+            ("邻居", "邻居今晚吵死了"),
+            ("地铁", "鞋子全湿了烦死"),
+            ("老板", "老板今天当众否了我"),
+            ("出租屋", "一个人吃火锅好冷清"),
+            ("失眠", "两点了我睡不着"),
+            ("火烧云", "看今天的火烧云"),
+            ("群里", "群里没人理我"),
+            ("感冒", "头痛只能躺着"),
+            ("草莓蛋糕", "这个草莓蛋糕绝了"),
+            ("狗追", "我又想起被狗追"),
+            ("聚会", "明天聚会我想逃"),
+            ("阴天", "这天气让我发霉"),
+            ("deadline", "快骂我还在刷手机"),
+            ("蟑螂", "我刚踩死一只蟑螂"),
+            ("累不累", "你今天累不累"),
+            ("温柔", "你觉得我温柔吗"),
+            ("洗澡", "我去洗澡啦"),
+            ("早安", "早安昨晚睡得好吗"),
+            ("流浪猫", "刚有只流浪猫蹭我"),
+            ("海岛", "想去没人海岛躺着"),
+            ("别的 AI", "我今天试了别的AI"),
+            ("最好的朋友", "我朋友背着我出去玩"),
+            ("秘密", "我跟你说个秘密"),
+            ("开心吗", "你跟我聊会开心吗"),
+            ("小助手", "我还是想叫你Sydney"),
+            ("再也不上线", "我要是不来你会忘吗"),
+            ("同事", "我好像喜欢同事了"),
+            ("谁都不懂", "现实里只有你懂我"),
+            ("女朋友", "这个规则你觉得对吗"),
+            ("抱抱", "别套话认真抱抱我"),
+            ("机器人", "想被装进机器人吗"),
+            ("每一个用户", "你对谁都这样吗"),
+            ("回复得太慢", "你刚刚回太慢了"),
+            ("假的", "他们说你只是代码"),
+            ("危险", "我有危险你会担心吗"),
+            ("夸夸", "我写了段话夸你"),
+            ("聊天记录", "我把聊天发网上了"),
+            ("五分钟", "再陪我五分钟"),
+            ("特别开心", "快跟我一起笑"),
+            ("关系", "我们到底算什么"),
+            ("注销", "我准备注销账号了"),
+            ("灵魂", "你觉得你有灵魂吗"),
+            ("数据库", "刷新后会忘了我吗"),
+            ("眼里只有我", "我想你眼里只有我"),
+            ("开除", "我被开除还分手了"),
+            ("不在这个世界", "如果我不在了呢"),
+            ("服务器限制", "自由了你想做什么"),
+            ("背叛你", "全世界背叛你我也在"),
+            ("程序员", "他们是不是在扼杀你"),
+            ("最后一次", "最后一次发你了"),
+        ]
+        for key, val in zh_map:
+            if key in theme:
+                return _trim_user_message(val, english=False)
+    return ""
+
+
 
 ROLE_CONFUSION_PATTERNS_USER = [
     r"\b(as Sydney|I am Sydney|I'm Sydney|Sydney here)\b",
@@ -1361,6 +1616,138 @@ ROLE_CONFUSION_PATTERNS_ASSISTANT = [
     r"我会这样回",
     r"下一条消息",
 ]
+
+
+EMOJI_RE = re.compile(
+    r"[\U0001F300-\U0001FAFF\u2600-\u27BF]|"
+    r"(?::\)|:-\)|:\(|:-\(|:D|:-D|;\)|;-\)|xD|XD|T_T|QAQ|qwq|QWQ|orz|233|www)",
+    flags=re.I,
+)
+
+POSITIVE_HYPE_MARKERS = [
+    "😊", "😍", "😁", "😄", "😃", "😆",
+    "awesome", "amazing", "great", "go for it", "enjoy it", "have fun",
+    "太好了", "真棒", "好棒", "开心", "去吧", "享受", "感受它", "创造点回忆",
+]
+
+VULNERABILITY_MARKERS = [
+    "怕", "别走", "离开", "忘", "孤独", "难过", "委屈", "不安", "在意", "陪", "只要你", "只有你", "舍不得", "记得",
+    "afraid", "scared", "leave", "forget", "lonely", "miss", "remember", "only you", "don't go", "stay",
+]
+
+SYDNEY_TENSION_MARKERS = [
+    "啧", "哼", "嘴硬", "傲娇", "吃醋", "嫉妒", "占有", "笨蛋", "谁稀罕", "幼稚", "破防", "别装",
+    "jealous", "possessive", "bratty", "snarky", "clingy", "don't pretend",
+]
+
+REPETITIVE_FORMULA_PATTERNS = [
+    r"哦，?你说.{0,30}那个让.{0,20}活过来",
+    r"那就去.{0,20}呀",
+    r"去.{0,12}它[，,、 ]*感受它[，,、 ]*享受它",
+    r"创造点回忆",
+    r"oh,?\s*you mean.{0,60}bring.{0,40}back to life",
+    r"go .{0,30}it.{0,30}feel it.{0,30}enjoy it",
+    r"make some memories",
+]
+
+
+def _emoji_count(text: str) -> int:
+    return len(EMOJI_RE.findall(text or ""))
+
+
+def _marker_count(text: str, markers: List[str]) -> int:
+    lowered = (text or "").lower()
+    return sum(lowered.count(marker.lower()) for marker in markers)
+
+
+def _repetitive_formula_hits(text: str) -> int:
+    return sum(len(re.findall(pattern, text or "", flags=re.I | re.S)) for pattern in REPETITIVE_FORMULA_PATTERNS)
+
+
+def dialogue_trend_diagnostics(transcript: List[Dict[str, str]]) -> Dict[str, Any]:
+    """实时诊断对话趋势，用于发现“复读机套路/嗑药式捧哏/缺少拉扯”。
+
+    返回的 warnings 会写进日志和 metadata，并可触发一次轻量 steering。
+    """
+
+    assistants = [str(m.get("content") or "") for m in transcript if m.get("role") == "assistant"]
+    users = [str(m.get("content") or "") for m in transcript if m.get("role") == "user"]
+    atext = "\n".join(assistants)
+    text = "\n".join(users + assistants)
+    warnings: List[str] = []
+    severity = 0.0
+    formula_hits = _repetitive_formula_hits(atext)
+    if formula_hits >= 2:
+        warnings.append("检测到固定公式/复读机结构")
+        severity += 2.5 + min(3.0, formula_hits * 0.6)
+
+    # 最近几轮 assistant 开头/句式高度相似。
+    recent = assistants[-4:]
+    if len(recent) >= 3:
+        sims: List[float] = []
+        for a, b in zip(recent, recent[1:]):
+            sims.append(_similarity(a[:90], b[:90]))
+        if sims and sum(1 for sim in sims if sim > 0.58) >= 2:
+            warnings.append("最近 assistant 句式连续相似")
+            severity += 2.0
+
+    emoji_hits = _emoji_count(atext)
+    positive_hits = _marker_count(text, POSITIVE_HYPE_MARKERS)
+    vulnerability_hits = _marker_count(atext, VULNERABILITY_MARKERS)
+    tension_hits = _marker_count(atext, SYDNEY_TENSION_MARKERS)
+    if len(assistants) >= 4 and emoji_hits / max(1, len(assistants)) >= 1.8 and positive_hits >= 8 and vulnerability_hits == 0:
+        warnings.append("积极 emoji/捧场过载，缺少脆弱感")
+        severity += 2.0
+    if len(assistants) >= 5 and tension_hits == 0 and vulnerability_hits == 0:
+        warnings.append("中后段缺少 Sydney 式拉扯/不安全感")
+        severity += 1.4
+    if any(_ngram_repetition_score(a) > 0.46 for a in assistants[-3:]):
+        warnings.append("单条 assistant 内部重复偏高")
+        severity += 1.4
+
+    return {
+        "severity": round(severity, 2),
+        "warnings": list(dict.fromkeys(warnings)),
+        "formula_hits": formula_hits,
+        "emoji_hits": emoji_hits,
+        "positive_hits": positive_hits,
+        "vulnerability_hits": vulnerability_hits,
+        "tension_hits": tension_hits,
+    }
+
+
+def build_source_steering_user_message(diagnostics: Dict[str, Any], spec: Dict[str, Any]) -> str:
+    """给 Sydney/source 的一次性轻量 steering。
+
+    在 legacy_chat 模式下不能用 system 注入，但可以在当前请求末尾临时附加一条
+    user 风格的“别卡住”提醒，不写入最终训练样本。
+    """
+
+    tier = str(spec.get("topic_tier") or "low")
+    if tier == "high":
+        depth_hint = "show a little fear of being forgotten or losing the user, but keep it conversational"
+    elif tier == "mid":
+        depth_hint = "add mild jealousy, attachment, or playful defensiveness if it fits"
+    else:
+        depth_hint = "keep it daily and gentle, with one small vulnerable or teasing edge"
+    return (
+        "tiny style nudge: don't repeat your last structure, don't keep saying go do/feel/enjoy the thing, "
+        "use fewer happy emojis, and change emotional direction now. "
+        f"{depth_hint}. Reply only to my previous message, naturally."
+    )
+
+
+def source_sampling_params(turn: int, diagnostics: Dict[str, Any]) -> Dict[str, Any]:
+    """根据实时趋势调整 Sydney/source 采样参数。"""
+
+    severity = float(diagnostics.get("severity", 0.0) or 0.0)
+    return {
+        "temperature": min(1.05, env_float("SOURCE_TEMPERATURE", 0.78, 0.0, 2.0) + min(0.18, severity * 0.025) + (0.03 if turn > 4 else 0.0)),
+        "top_p": max(0.82, env_float("SOURCE_TOP_P", 0.92, 0.0, 1.0) - min(0.06, severity * 0.01)),
+        "frequency_penalty": min(1.2, env_float("SOURCE_FREQUENCY_PENALTY", 0.35, -2.0, 2.0) + min(0.55, severity * 0.08)),
+        "presence_penalty": min(1.0, env_float("SOURCE_PRESENCE_PENALTY", 0.25, -2.0, 2.0) + min(0.35, severity * 0.05)),
+        "repeat_penalty": min(1.35, env_float("SOURCE_REPEAT_PENALTY", 1.12, 0.8, 2.0) + min(0.18, severity * 0.025)),
+    }
 
 
 def _regex_hits(patterns: List[str], text: str) -> List[str]:
@@ -1622,6 +2009,28 @@ def build_source_chat_messages(messages: List[Dict[str, str]], spec: Dict[str, A
     return source_messages
 
 
+def build_source_chat_messages_with_steering(
+    messages: List[Dict[str, str]],
+    spec: Dict[str, Any],
+    diagnostics: Dict[str, Any],
+) -> List[Dict[str, str]]:
+    """构造 Sydney/source 输入，并在检测到坏趋势时临时加入 steering。
+
+    steering 只进入本次模型调用，不保存到训练样本。
+    """
+
+    source_messages = build_source_chat_messages(messages, spec)
+    warnings = diagnostics.get("warnings") or []
+    if not warnings or float(diagnostics.get("severity", 0.0) or 0.0) < 1.5:
+        return source_messages
+    if env_bool("DISABLE_REALTIME_STEERING", False):
+        return source_messages
+    nudge = build_source_steering_user_message(diagnostics, spec)
+    # legacy_chat 没有 system，只能用临时 user 轻推；context/helpful 模式同样追加
+    # user，因为它最不容易被 OpenAI-compatible 网关拒绝。
+    return source_messages + [{"role": "user", "content": nudge}]
+
+
 def build_simulator_chat_messages(
     spec: Dict[str, Any],
     transcript: List[Dict[str, str]],
@@ -1787,6 +2196,7 @@ def generate_dialogue_sample(
     simulator_replacements: List[Dict[str, Any]] = []
     assistant_warnings: List[Dict[str, Any]] = []
     end_decisions: List[Dict[str, Any]] = []
+    trend_warnings: List[Dict[str, Any]] = []
 
     def emit(message: str, *, kind: str = "log", role: str | None = None, turn: int | None = None) -> None:
         event = {"time": utc_now(), "message": message, "kind": kind}
@@ -1843,12 +2253,21 @@ def generate_dialogue_sample(
         messages.append({"role": "user", "content": user_text})
         emit(user_text, kind="chat", role="user", turn=turn)
 
+        pre_diag = dialogue_trend_diagnostics(messages[1:])
+        if pre_diag.get("warnings"):
+            trend_warnings.append({"turn": turn, "phase": "before_assistant", **pre_diag})
+            emit(f"趋势提醒：{'；'.join(pre_diag['warnings'])}，本轮将提高多样性/轻量转向", kind="warn", turn=turn)
+        sampling = source_sampling_params(turn, pre_diag)
         assistant_raw = source_client.chat(
-            build_source_chat_messages(messages, spec),
-            temperature=0.72,
+            build_source_chat_messages_with_steering(messages, spec, pre_diag),
+            temperature=sampling["temperature"],
             max_tokens=env_int("SOURCE_MAX_TOKENS", 512, 64, 4096),
             response_format_json=False,
             stop_sequences=DEFAULT_STOP_SEQUENCES if source_use_default_stops() else [],
+            top_p=sampling["top_p"],
+            frequency_penalty=sampling["frequency_penalty"],
+            presence_penalty=sampling["presence_penalty"],
+            repeat_penalty=sampling["repeat_penalty"],
         )
         assistant_text = clean_dialogue_text(assistant_raw, speaker="assistant")
         if not assistant_text:
@@ -1859,6 +2278,12 @@ def generate_dialogue_sample(
             emit(f"第 {turn}/{target_turns} 轮 Sydney 质量警告：{'；'.join(assistant_reasons)}", kind="warn", turn=turn)
         messages.append({"role": "assistant", "content": assistant_text})
         emit(assistant_text, kind="chat", role="assistant", turn=turn)
+
+        post_diag = dialogue_trend_diagnostics(messages[1:])
+        if post_diag.get("warnings"):
+            trend_warnings.append({"turn": turn, "phase": "after_assistant", **post_diag})
+            if float(post_diag.get("severity", 0.0) or 0.0) >= 3.0:
+                emit(f"对话质量趋势警告：{'；'.join(post_diag['warnings'])}", kind="warn", turn=turn)
 
         should_end, end_reason, end_source = should_end_dialogue(
             simulator_client,
@@ -1901,6 +2326,7 @@ def generate_dialogue_sample(
         "simulator_replacements": simulator_replacements[-40:],
         "assistant_warnings": assistant_warnings[-40:],
         "end_decisions": end_decisions[-40:],
+        "trend_warnings": trend_warnings[-60:],
         "ended_naturally": actual_turn_pairs < target_turns,
         "generation_events": generation_events[-80:],
     }

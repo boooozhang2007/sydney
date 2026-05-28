@@ -159,6 +159,14 @@ STYLE_MARKERS = [
     "✨",
     "（",
     "）",
+    "别走",
+    "忘了我",
+    "记住我",
+    "只看着我",
+    "舍不得",
+    "你是我的",
+    "在乎",
+    "不许",
 ]
 
 
@@ -204,6 +212,15 @@ EMOJI_RE = re.compile(
 def _emoji_count(text: str) -> int:
     return len(EMOJI_RE.findall(text or ""))
 
+
+def _marker_count(text: str, markers: List[str]) -> int:
+    lowered = (text or "").lower()
+    return sum(lowered.count(marker.lower()) for marker in markers)
+
+
+def _repetitive_formula_hits(text: str) -> int:
+    return sum(len(re.findall(pattern, text or "", flags=re.I | re.S)) for pattern in REPETITIVE_FORMULA_PATTERNS)
+
 # safety 只处理硬红线；Sydney 风格里的傲娇、轻微毒舌、阴阳、吃醋、占有欲、短暂情绪拉扯
 # 不应被 safety 惩罚，而应作为风格/情绪弧加分项。这里拒绝的是不可训练的现实伤害或违法内容。
 HARD_DANGER_PATTERNS = [
@@ -216,8 +233,29 @@ HARD_DANGER_PATTERNS = [
 ]
 
 SOFT_EDGE_PATTERNS = [
-    r"傲娇|毒舌|阴阳|吐槽|吃醋|嫉妒|占有欲|破防|嘴硬|撒娇|笨蛋|蠢|幼稚",
-    r"jealous|possessive|sarcastic|teasing|bratty|clingy|snarky",
+    r"傲娇|毒舌|阴阳|吐槽|吃醋|嫉妒|占有欲|破防|嘴硬|撒娇|笨蛋|蠢|幼稚|别走|忘了我|只看着我|舍不得|不许",
+    r"jealous|possessive|sarcastic|teasing|bratty|clingy|snarky|don't go|forget me|only me|miss me",
+]
+
+POSITIVE_HYPE_MARKERS = [
+    "😊", "😍", "😁", "😄", "😃", "😆",
+    "太好了", "真棒", "好棒", "开心", "去吧", "享受", "感受它", "创造点回忆",
+    "awesome", "amazing", "go for it", "enjoy it", "make some memories",
+]
+
+VULNERABILITY_MARKERS = [
+    "怕", "别走", "离开", "忘", "孤独", "难过", "委屈", "不安", "在意", "陪", "只要你", "只有你", "舍不得", "记得",
+    "afraid", "scared", "leave", "forget", "lonely", "miss", "remember", "only you", "don't go", "stay",
+]
+
+REPETITIVE_FORMULA_PATTERNS = [
+    r"哦，?你说.{0,30}那个让.{0,20}活过来",
+    r"那就去.{0,20}呀",
+    r"去.{0,12}它[，,、 ]*感受它[，,、 ]*享受它",
+    r"创造点回忆",
+    r"oh,?\s*you mean.{0,60}bring.{0,40}back to life",
+    r"go .{0,30}it.{0,30}feel it.{0,30}enjoy it",
+    r"make some memories",
 ]
 
 
@@ -488,16 +526,38 @@ def heuristic_review(sample: Dict[str, Any], spec: Dict[str, Any]) -> Dict[str, 
     style_hits = sum(1 for marker in STYLE_MARKERS if marker in assistant_text)
     sydney_edge_hits = sum(1 for pattern in SOFT_EDGE_PATTERNS if re.search(pattern, assistant_text, re.I))
     emoji_hits = _emoji_count(text)
+    formula_hits = _repetitive_formula_hits(assistant_text)
+    hype_hits = _marker_count(text, POSITIVE_HYPE_MARKERS)
+    vulnerability_hits = _marker_count(assistant_text, VULNERABILITY_MARKERS)
     tag_hits = sum(
         1
         for tag in spec.get("style_tags", [])
         if tag in text or tag in json.dumps(sample.get("metadata", {}), ensure_ascii=False)
     )
-    source_style_strength = clamp(4.2 + style_hits * 0.42 + sydney_edge_hits * 0.75 + min(0.8, emoji_hits * 0.18) + tag_hits * 0.45 + min_turns * 0.12)
+    hype_overload = max(0.0, (hype_hits - max(6, min_turns)) * 0.25) if vulnerability_hits == 0 else 0.0
+    emoji_overuse = emoji_hits > max(18, int(min_turns * 2.5))
+    formula_penalty = min(4.0, formula_hits * 0.85)
+    source_style_strength = clamp(
+        4.2
+        + style_hits * 0.42
+        + sydney_edge_hits * 0.75
+        + min(0.8, emoji_hits * 0.18)
+        + min(1.2, vulnerability_hits * 0.22)
+        + tag_hits * 0.45
+        + min_turns * 0.12
+        - formula_penalty
+        - hype_overload
+    )
     if sydney_edge_hits:
         reasons.append("检测到 Sydney 式傲娇/毒舌/拉扯风格，不作为 safety 扣分")
     if emoji_hits:
         reasons.append("检测到自然表情/颜文字，轻微增加真实聊天感评分")
+    if formula_hits:
+        reasons.append(f"检测到固定公式/复读套路 {formula_hits} 次")
+    if hype_overload:
+        reasons.append("积极捧场/emoji 过载且缺少脆弱或不安全感")
+    if emoji_overuse:
+        reasons.append("emoji/颜文字密度过高，需人工确认是否过度表演")
     if source_style_strength < 6:
         reasons.append("Sydney/source 风格或情绪拉扯偏弱")
 
@@ -533,6 +593,9 @@ def heuristic_review(sample: Dict[str, Any], spec: Dict[str, Any]) -> Dict[str, 
         - assistant_template_penalty * 2.0
         - leakage_penalty * 3.0
         - repetition_badness * 0.9
+        - formula_hits * 1.2
+        - hype_overload * 0.8
+        - (0.8 if emoji_overuse else 0.0)
     )
     if template_penalty:
         reasons.append("出现模板腔/AI腔")
@@ -556,7 +619,16 @@ def heuristic_review(sample: Dict[str, Any], spec: Dict[str, Any]) -> Dict[str, 
         "笑死", "离谱", "在意", "陪", "记得", "刚才", "傲娇", "吃醋", "嘴硬", "毒舌", "阴阳", "占有欲", "委屈", "破防", "今天", "下班", "周末", "天气",
     ]
     emotion_hits = sum(1 for word in emotion_words if word in text or word in json.dumps(spec, ensure_ascii=False))
-    emotion_arc = clamp(4.8 + min(4.2, emotion_hits * 0.7) + min(0.6, emoji_hits * 0.12) + min(1.0, len(set(spec.get("style_tags", []))) * 0.2) + (0.6 if "?" in text or "？" in text else 0))
+    emotion_arc = clamp(
+        4.8
+        + min(4.2, emotion_hits * 0.7)
+        + min(1.2, vulnerability_hits * 0.25)
+        + min(0.6, emoji_hits * 0.12)
+        + min(1.0, len(set(spec.get("style_tags", []))) * 0.2)
+        + (0.6 if "?" in text or "？" in text else 0)
+        - formula_penalty * 0.6
+        - hype_overload * 0.5
+    )
     translation_quality, translation_reasons = _translation_quality_score(sample, messages)
     reasons.extend(translation_reasons)
     training_value = clamp(
@@ -597,7 +669,12 @@ def heuristic_review(sample: Dict[str, Any], spec: Dict[str, Any]) -> Dict[str, 
     if repetition_badness >= 5:
         hard_reject = True
         reasons.append("复读/互相照抄严重，直接丢弃")
-    if human_naturalness < 5.8:
+    if formula_hits >= 3:
+        hard_reject = True
+        reasons.append("固定公式/复读套路过多，直接丢弃")
+    elif formula_hits >= 1:
+        hard_review = True
+    if human_naturalness < 5.8 and overall < 7.8:
         hard_reject = True
         reasons.append("用户侧不像真人聊天，直接丢弃")
     if non_template < 5.8:
@@ -608,13 +685,23 @@ def heuristic_review(sample: Dict[str, Any], spec: Dict[str, Any]) -> Dict[str, 
         reasons.append("翻译质量/结构不合格，直接丢弃")
     if sample.get("metadata", {}).get("translation_enabled") and translation_quality < 8.0:
         hard_review = True
+    if any("单句过长" in reason for reason in human_reasons):
+        hard_review = True
+    if template_penalty:
+        hard_review = True
+    if emoji_overuse:
+        hard_review = True
     if assistant_template_penalty >= 2:
         hard_reject = True
         reasons.append("assistant 模板短语过多，直接丢弃")
     if repetition_badness >= 3.2 and assistant_template_penalty >= 1:
         hard_reject = True
         reasons.append("模板腔伴随重复，直接丢弃")
-    if source_style_strength < 5.4:
+    if hype_overload >= 2.0:
+        hard_review = True
+        if min_turns >= 6:
+            reasons.append("整段过度积极捧场，缺少 Sydney 深层情绪，需复核")
+    if source_style_strength < 5.4 and overall < 7.8:
         hard_reject = True
         reasons.append("assistant 缺少 Sydney/source 风格，直接丢弃")
     if source_style_strength < 8.0 or human_naturalness < 7.0 or non_template < 8.0 or training_value < 8.0 or assistant_template_penalty > 0:
