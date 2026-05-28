@@ -228,6 +228,8 @@ class ModelConfig:
     model: str = ""
     api_protocol: str = "responses"
     timeout: float = 120.0
+    retries: int = 2
+    retry_backoff: float = 1.5
 
     @property
     def ready(self) -> bool:
@@ -246,7 +248,9 @@ class ModelConfig:
             api_key=os.getenv(f"{prefix}_API_KEY", "").strip(),
             model=os.getenv(f"{prefix}_MODEL", "").strip(),
             api_protocol=normalize_api_protocol(api_protocol),
-            timeout=float(os.getenv(f"{prefix}_TIMEOUT", "120") or 120),
+            timeout=float(os.getenv(f"{prefix}_TIMEOUT", os.getenv("MODEL_TIMEOUT", "300")) or 300),
+            retries=int(os.getenv(f"{prefix}_RETRIES", os.getenv("MODEL_RETRIES", "2")) or 2),
+            retry_backoff=float(os.getenv(f"{prefix}_RETRY_BACKOFF", os.getenv("MODEL_RETRY_BACKOFF", "1.5")) or 1.5),
         )
 
 
@@ -395,6 +399,38 @@ class OpenAICompatibleClient:
             )
         return f"{type(exc).__name__}: {exc}"
 
+    def _post_json(self, endpoint: str, headers: Dict[str, str], body: Dict[str, Any]) -> Dict[str, Any]:
+        """带轻量重试的 JSON POST。
+
+        高并发本地/隧道/llama.cpp 服务偶尔会 ReadTimeout、ConnectError 或 429/503。
+        这里对这些瞬时错误做指数退避重试；非瞬时 4xx 仍直接暴露。
+        """
+
+        timeout = httpx.Timeout(self.config.timeout, connect=min(30.0, self.config.timeout))
+        max_attempts = max(1, int(getattr(self.config, "retries", 2) or 0) + 1)
+        retry_statuses = {408, 409, 425, 429, 500, 502, 503, 504}
+        last_exc: Exception | None = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                with httpx.Client(timeout=timeout) as client:
+                    resp = client.post(endpoint, headers=headers, json=body)
+                    if resp.status_code in retry_statuses and attempt < max_attempts:
+                        delay = float(getattr(self.config, "retry_backoff", 1.5) or 1.5) * attempt
+                        time.sleep(min(delay, 10.0))
+                        continue
+                    resp.raise_for_status()
+                    return resp.json()
+            except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.ConnectError, httpx.RemoteProtocolError) as exc:
+                last_exc = exc
+                if attempt >= max_attempts:
+                    break
+                delay = float(getattr(self.config, "retry_backoff", 1.5) or 1.5) * attempt
+                time.sleep(min(delay, 10.0))
+            except Exception:
+                raise
+        assert last_exc is not None
+        raise last_exc
+
     def _chat_completions(
         self,
         messages: List[Dict[str, str]],
@@ -438,14 +474,7 @@ class OpenAICompatibleClient:
 
         endpoint = f"{self.base_url}/chat/completions"
         try:
-            with httpx.Client(timeout=self.config.timeout) as client:
-                resp = client.post(
-                    endpoint,
-                    headers=self._headers(),
-                    json=body,
-                )
-                resp.raise_for_status()
-                data = resp.json()
+            data = self._post_json(endpoint, self._headers(), body)
         except Exception as exc:  # noqa: BLE001
             raise ModelClientError(
                 f"调用 Chat Completions 失败：{self._format_http_error(exc, endpoint)}"
@@ -497,14 +526,7 @@ class OpenAICompatibleClient:
 
         endpoint = f"{self.base_url}/messages"
         try:
-            with httpx.Client(timeout=self.config.timeout) as client:
-                resp = client.post(
-                    endpoint,
-                    headers=self._claude_headers(),
-                    json=body,
-                )
-                resp.raise_for_status()
-                data = resp.json()
+            data = self._post_json(endpoint, self._claude_headers(), body)
         except Exception as exc:  # noqa: BLE001
             raise ModelClientError(
                 f"调用 Claude Messages API 失败：{self._format_http_error(exc, endpoint)}"
@@ -613,14 +635,7 @@ class OpenAICompatibleClient:
 
         endpoint = f"{self.base_url}/responses"
         try:
-            with httpx.Client(timeout=self.config.timeout) as client:
-                resp = client.post(
-                    endpoint,
-                    headers=self._headers(),
-                    json=body,
-                )
-                resp.raise_for_status()
-                data = resp.json()
+            data = self._post_json(endpoint, self._headers(), body)
         except Exception as exc:  # noqa: BLE001
             raise ModelClientError(
                 f"调用 Responses API 失败：{self._format_http_error(exc, endpoint)}"

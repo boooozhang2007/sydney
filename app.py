@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
@@ -46,6 +47,26 @@ JOBS_LOCK = threading.Lock()
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = (os.getenv(name, "") or "").strip().lower()
+    if not value:
+        return default
+    return value in {"1", "true", "yes", "y", "on"}
+
+
+def env_int(name: str, default: int, lo: int, hi: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)) or default)
+    except Exception:
+        value = default
+    return max(lo, min(hi, value))
+
+
+def env_str(name: str, default: str = "") -> str:
+    return (os.getenv(name, default) or default).strip()
+
 
 
 def ensure_dirs() -> None:
@@ -99,6 +120,43 @@ def job_file(job_id: str) -> Path:
     return JOBS_DIR / f"{Path(job_id).name}.json"
 
 
+JOB_LOG_KEEP = env_int("JOB_LOG_KEEP", 240, 20, 800)
+JOB_LOG_PERSIST_KEEP = env_int("JOB_LOG_PERSIST_KEEP", 120, 20, 400)
+JOB_RESTORE_LIMIT = env_int("JOB_RESTORE_LIMIT", 10, 0, 80)
+JOB_API_LOG_LIMIT = env_int("JOB_API_LOG_LIMIT", 120, 0, 300)
+JOB_API_ERROR_LIMIT = env_int("JOB_API_ERROR_LIMIT", 80, 0, 300)
+JOB_RESULT_ITEM_LIMIT = env_int("JOB_RESULT_ITEM_LIMIT", 50, 0, 500)
+# 高并发时不要每条日志/计数都立刻落盘；否则 Windows 上容易和杀软/索引器抢文件句柄。
+JOB_PERSIST_MIN_INTERVAL_MS = env_int("JOB_PERSIST_MIN_INTERVAL_MS", 1000, 0, 60000)
+JOB_PERSIST_EVERY_UPDATES = env_int("JOB_PERSIST_EVERY_UPDATES", 25, 1, 1000)
+JOB_PERSIST_RETRIES = env_int("JOB_PERSIST_RETRIES", 8, 1, 50)
+
+
+def compact_job_for_persist(job: Dict[str, Any]) -> Dict[str, Any]:
+    """压缩 job 快照，避免 3000+ 大任务把 data/jobs 写成超大 JSON。"""
+
+    slim = {k: v for k, v in job.items() if not str(k).startswith("_")}
+    slim["logs"] = list(slim.get("logs") or [])[-JOB_LOG_PERSIST_KEEP:]
+    slim["errors"] = list(slim.get("errors") or [])[-JOB_API_ERROR_LIMIT:]
+    result = slim.get("result")
+    if isinstance(result, dict):
+        result = dict(result)
+        if isinstance(result.get("generated"), list):
+            result["generated_count"] = len(result["generated"])
+            result["generated"] = result["generated"][-JOB_RESULT_ITEM_LIMIT:]
+        slim["result"] = result
+    return slim
+
+
+def compact_job_for_api(job: Dict[str, Any]) -> Dict[str, Any]:
+    """返回给前端的轻量 job，避免恢复任务时页面被大日志卡死。"""
+
+    slim = compact_job_for_persist(job)
+    slim["logs"] = list(job.get("logs") or [])[-JOB_API_LOG_LIMIT:]
+    slim["errors"] = list(job.get("errors") or [])[-JOB_API_ERROR_LIMIT:]
+    return slim
+
+
 def enrich_job_progress(job: Dict[str, Any]) -> Dict[str, Any]:
     """给任务快照补充前端需要的 progress 字段。"""
 
@@ -113,20 +171,57 @@ def enrich_job_progress(job: Dict[str, Any]) -> Dict[str, Any]:
     return enriched
 
 
-def persist_job_locked(job_id: str) -> None:
+def persist_job_locked(job_id: str, *, force: bool = False) -> None:
     """把内存中的 job 原子写入 data/jobs。
 
     调用方必须已经持有 JOBS_LOCK。
+
+    高并发生成时 job_log/job_inc 会非常频繁。Windows 下对同一个 JSON 文件
+    高频 replace 偶尔会被杀软/索引器/另一个读取者短暂占用，抛出 WinError 5。
+    所以这里做三件事：
+    1. 非关键更新按时间/次数节流落盘；
+    2. 每次写唯一 tmp 文件，避免 tmp 名称冲突；
+    3. replace 失败时短暂重试，最终只告警，不让样本生成失败。
     """
 
     job = JOBS.get(job_id)
     if not job:
         return
+
+    now = time.monotonic()
+    if not force:
+        dirty = int(job.get("_persist_dirty_count", 0) or 0) + 1
+        last = float(job.get("_last_persist_monotonic", 0.0) or 0.0)
+        job["_persist_dirty_count"] = dirty
+        if dirty < JOB_PERSIST_EVERY_UPDATES and (now - last) * 1000 < JOB_PERSIST_MIN_INTERVAL_MS:
+            return
+
+    job["_persist_dirty_count"] = 0
+    job["_last_persist_monotonic"] = now
     ensure_dirs()
     path = job_file(job_id)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    payload = json.dumps(compact_job_for_persist(job), ensure_ascii=False, indent=2)
+    last_exc: Exception | None = None
+
+    for attempt in range(1, JOB_PERSIST_RETRIES + 1):
+        tmp = path.with_name(
+            f"{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
+        )
+        try:
+            tmp.write_text(payload, encoding="utf-8")
+            os.replace(tmp, path)
+            return
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
+            # PermissionError/WinError 5 通常是瞬时文件句柄占用，退避后重试。
+            time.sleep(min(0.05 * attempt, 0.5))
+
+    print(f"[Sydney Data Factory] warning: failed to persist job {job_id}: {last_exc}")
 
 
 def load_jobs_from_disk() -> None:
@@ -138,12 +233,16 @@ def load_jobs_from_disk() -> None:
     """
 
     ensure_dirs()
+    if env_bool("DISABLE_JOB_RESTORE", False) or JOB_RESTORE_LIMIT <= 0:
+        print("[Sydney Data Factory] job snapshot restore disabled")
+        return
     loaded = 0
     now = utc_now()
-    for path in sorted(JOBS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:80]:
+    for path in sorted(JOBS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:JOB_RESTORE_LIMIT]:
         try:
             job = json.loads(path.read_text(encoding="utf-8"))
             job_id = str(job.get("id") or path.stem)
+            job = compact_job_for_persist(job)
             if job.get("status") in {"queued", "running"}:
                 job["status"] = "interrupted"
                 job["finished_at"] = now
@@ -159,7 +258,7 @@ def load_jobs_from_disk() -> None:
                 )
             with JOBS_LOCK:
                 JOBS[job_id] = job
-                persist_job_locked(job_id)
+                persist_job_locked(job_id, force=True)
             loaded += 1
         except Exception:
             # 损坏的 job 文件不影响主应用启动。
@@ -182,31 +281,12 @@ WEB_DIR.mkdir(exist_ok=True)
 app.mount("/web", StaticFiles(directory=WEB_DIR), name="web")
 
 
-def env_bool(name: str, default: bool = False) -> bool:
-    value = (os.getenv(name, "") or "").strip().lower()
-    if not value:
-        return default
-    return value in {"1", "true", "yes", "y", "on"}
-
-
-def env_int(name: str, default: int, lo: int, hi: int) -> int:
-    try:
-        value = int(os.getenv(name, str(default)) or default)
-    except Exception:
-        value = default
-    return max(lo, min(hi, value))
-
-
-def env_str(name: str, default: str = "") -> str:
-    return (os.getenv(name, default) or default).strip()
-
-
 def app_defaults() -> Dict[str, Any]:
     """页面刷新后恢复的默认生成/导出参数。"""
 
     return {
-        "count": env_int("APP_DEFAULT_COUNT", 5, 1, 100),
-        "concurrency": env_int("APP_DEFAULT_CONCURRENCY", 3, 1, 16),
+        "count": env_int("APP_DEFAULT_COUNT", 5, 1, 10000),
+        "concurrency": env_int("APP_DEFAULT_CONCURRENCY", 3, 1, 128),
         "max_turns": env_int("APP_DEFAULT_MAX_TURNS", 12, 2, 20),
         "translate_to_zh": env_bool("APP_DEFAULT_TRANSLATE_TO_ZH", True),
         "same_aux_model": env_bool("APP_DEFAULT_SAME_AUX_MODEL", False),
@@ -246,13 +326,17 @@ class EndpointPayload(BaseModel):
             model=(self.model or env.model or "").strip(),
             api_protocol=(self.api_protocol or env.api_protocol or "responses").strip(),
             timeout=env.timeout,
+            retries=env.retries,
+            retry_backoff=env.retry_backoff,
         )
 
 
 class GenerateRequest(BaseModel):
-    count: int = Field(default=5, ge=1, le=100)
-    concurrency: int = Field(default=3, ge=1, le=16)
-    max_turns: int = Field(default=12, ge=2, le=20)
+    # 允许大批量任务。3000 条这类长任务会以后台 job 方式运行，前端轮询进度。
+    count: int = Field(default=5, ge=1, le=10000)
+    # 大批量数据允许更高并发；实际建议按 Teacher/Translator/Judge API 限额设置。
+    concurrency: int = Field(default=3, ge=1, le=128)
+    max_turns: int = Field(default=20, ge=2, le=20)
     # 默认启用：英文源对话 -> 中文翻译。Clever Sydney GGUF 的英文分布明显强于中文直出。
     translate_to_zh: bool = True
     # 勾选后 Human Simulator / Translator / Judge 共用同一个强模型配置。
@@ -468,7 +552,8 @@ def job_update(job_id: str, **fields: Any) -> None:
             return
         job.update(fields)
         job["updated_at"] = utc_now()
-        persist_job_locked(job_id)
+        force = any(k in fields for k in {"status", "started_at", "finished_at", "result"})
+        persist_job_locked(job_id, force=force)
 
 
 def job_log(
@@ -498,9 +583,10 @@ def job_log(
             event["turn"] = turn
         logs.append(event)
         # 避免长时间批量生成时内存无限增长。
-        if len(logs) > 800:
-            del logs[: len(logs) - 800]
+        if len(logs) > JOB_LOG_KEEP:
+            del logs[: len(logs) - JOB_LOG_KEEP]
         job["updated_at"] = utc_now()
+        # 高并发下错误日志可能瞬间很多，不强制每条落盘，避免 Windows replace 抢占。
         persist_job_locked(job_id)
 
 
@@ -521,7 +607,7 @@ def job_snapshot(job_id: str) -> Dict[str, Any]:
     with JOBS_LOCK:
         job = JOBS.get(job_id)
         if job:
-            return json.loads(json.dumps(job, ensure_ascii=False))
+            return json.loads(json.dumps(compact_job_for_api(job), ensure_ascii=False))
 
     # 兜底：如果内存中没有，但 data/jobs 里有快照，也允许前端恢复查看。
     path = job_file(job_id)
@@ -530,7 +616,7 @@ def job_snapshot(job_id: str) -> Dict[str, Any]:
             job = json.loads(path.read_text(encoding="utf-8"))
             with JOBS_LOCK:
                 JOBS[job_id] = job
-            return json.loads(json.dumps(job, ensure_ascii=False))
+            return json.loads(json.dumps(compact_job_for_api(job), ensure_ascii=False))
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=500, detail=f"job snapshot corrupted: {exc}") from exc
     raise HTTPException(status_code=404, detail="job not found")
@@ -715,7 +801,7 @@ def run_generation_job(
                     "errors": job.get("errors", []),
                     "batch_path": str(batch_path.relative_to(ROOT)) if batch_path else None,
                 }
-                persist_job_locked(job_id)
+                persist_job_locked(job_id, force=True)
         job_update(job_id, status=final_status, finished_at=utc_now())
         job_log(job_id, f"任务完成：成功 {len(generated)} 条，失败 {job_snapshot(job_id).get('failed', 0)} 条", level="ok")
     except Exception as exc:  # noqa: BLE001
@@ -908,7 +994,7 @@ def generate(req: GenerateRequest) -> Dict[str, Any]:
     }
     with JOBS_LOCK:
         JOBS[job_id] = job
-        persist_job_locked(job_id)
+        persist_job_locked(job_id, force=True)
     job_log(job_id, "任务已入队，后台线程即将启动")
     if req.same_aux_model:
         job_log(job_id, f"已启用共用强模型：来源={shared_aux_source or 'unknown'}，model={shared_aux_cfg.model if shared_aux_cfg else ''}")
@@ -934,7 +1020,7 @@ def list_jobs(limit: int = 20, active: bool = False) -> Dict[str, Any]:
     limit = max(1, min(100, int(limit or 20)))
     active_status = {"queued", "running"}
     with JOBS_LOCK:
-        jobs = [json.loads(json.dumps(job, ensure_ascii=False)) for job in JOBS.values()]
+        jobs = [json.loads(json.dumps(compact_job_for_api(job), ensure_ascii=False)) for job in JOBS.values()]
     if active:
         jobs = [job for job in jobs if job.get("status") in active_status]
     jobs.sort(key=lambda x: x.get("updated_at") or x.get("created_at") or "", reverse=True)
@@ -944,6 +1030,42 @@ def list_jobs(limit: int = 20, active: bool = False) -> Dict[str, Any]:
 @app.get("/api/jobs/{job_id}")
 def get_job(job_id: str) -> Dict[str, Any]:
     return enrich_job_progress(job_snapshot(job_id))
+
+
+
+
+@app.delete("/api/jobs/{job_id}")
+def delete_job(job_id: str) -> Dict[str, Any]:
+    """删除单个任务快照。只影响进度面板，不删除已入库样本。"""
+
+    safe_id = Path(job_id).name
+    with JOBS_LOCK:
+        JOBS.pop(safe_id, None)
+    path = job_file(safe_id)
+    if path.exists():
+        path.unlink()
+    return {"ok": True, "deleted": safe_id}
+
+
+@app.post("/api/jobs/clear")
+def clear_jobs() -> Dict[str, Any]:
+    """清空所有任务快照。只影响进度面板，不删除数据集样本。"""
+
+    with JOBS_LOCK:
+        JOBS.clear()
+    removed = 0
+    for path in JOBS_DIR.glob("*.json"):
+        try:
+            path.unlink()
+            removed += 1
+        except Exception:
+            pass
+    for path in JOBS_DIR.glob("*.json.tmp"):
+        try:
+            path.unlink()
+        except Exception:
+            pass
+    return {"ok": True, "removed": removed}
 
 
 @app.get("/api/samples")
@@ -1176,7 +1298,7 @@ INDEX_HTML = r"""
             <label class="hint" style="display:block;margin-top:10px"><input id="useJudge" type="checkbox" /> 使用 LLM Judge</label>
           </div></details>
           <details class="section" open><summary>生成参数</summary><div class="sectionInner">
-            <div class="row"><div><div class="label">数量</div><input id="count" class="input" type="number" min="1" max="100" value="5" /></div><div><div class="label">并发</div><input id="concurrency" class="input" type="number" min="1" max="16" value="3" /></div></div>
+            <div class="row"><div><div class="label">数量</div><input id="count" class="input" type="number" min="1" max="10000" value="5" /></div><div><div class="label">并发</div><input id="concurrency" class="input" type="number" min="1" max="128" value="3" /></div></div>
             <div class="label">最大轮数</div><input id="maxTurns" class="input" type="number" min="2" max="20" value="12" />
             <div class="label">随机种子</div><input id="seed" class="input" type="number" placeholder="可空" />
             <button id="genBtn" class="btn" style="margin-top:12px" onclick="generate()">生成 + 审核</button>
@@ -1225,7 +1347,8 @@ function isActiveJob(job){return job && ['queued','running'].includes(job.status
 function rememberJob(jobId){state.currentJob=jobId||null; if(jobId){localStorage.setItem(JOB_STORAGE_KEY,jobId)}else{localStorage.removeItem(JOB_STORAGE_KEY)}}
 function togglePanel(id){document.getElementById(id)?.classList.toggle('collapsed')}
 function toast(msg){const box=document.getElementById('toast'); const d=document.createElement('div'); d.textContent=msg; box.appendChild(d); setTimeout(()=>d.remove(),5200)}
-async function api(path, opts={}){const res=await fetch(path,{headers:{'Content-Type':'application/json'},...opts}); const txt=await res.text(); let data={}; try{data=txt?JSON.parse(txt):{}}catch(e){data={raw:txt}} if(!res.ok) throw new Error(data.detail||data.error||txt||res.statusText); return data}
+function errorText(x){if(!x) return ''; if(typeof x==='string') return x; if(Array.isArray(x)) return x.map(errorText).filter(Boolean).join('；'); if(typeof x==='object'){if(x.msg){let loc=Array.isArray(x.loc)?x.loc.join('.'):x.loc; return (loc?loc+': ':'')+x.msg} if(x.message) return x.message; if(x.detail) return errorText(x.detail); try{return JSON.stringify(x)}catch(e){return String(x)}} return String(x)}
+async function api(path, opts={}){const res=await fetch(path,{headers:{'Content-Type':'application/json'},...opts}); const txt=await res.text(); let data={}; try{data=txt?JSON.parse(txt):{}}catch(e){data={raw:txt}} if(!res.ok) throw new Error(errorText(data.detail||data.error||data.raw||txt||res.statusText)); return data}
 function endpoint(prefix){return {base_url:document.getElementById(prefix+'Base').value.trim(), api_key:document.getElementById(prefix+'Key').value.trim(), model:document.getElementById(prefix+'Model').value.trim(), api_protocol:document.getElementById(prefix+'Protocol').value}}
 function firstReadyAuxEndpoint(){for(const p of ['translator','simulator','judge']){const ep=endpoint(p); if(ep.base_url&&ep.model) return {prefix:p, endpoint:ep}} return {prefix:'translator', endpoint:endpoint('translator')}}
 function effectiveEndpoint(prefix){if(sameAuxModel.checked && ['simulator','translator','judge'].includes(prefix)){return firstReadyAuxEndpoint().endpoint} return endpoint(prefix)}
@@ -1249,7 +1372,7 @@ async function testTranslator(){try{const ep=effectiveEndpoint('translator'); co
 function renderJob(job){jobPanel.style.display='block'; const total=Number(job.total||0); const done=Number(job.completed||0); const pct=job.progress?job.progress.percent:(total?Math.round(done*1000/total)/10:0); jobStatus.textContent=`${job.status} · ${done}/${total} · ${pct}%`; jobBar.style.width=`${Math.max(0,Math.min(100,pct))}%`; const trans=job.translate_to_zh?'en→zh':'en only'; const translator=job.translator?.enabled?job.translator.model:'disabled'; const shared=job.same_aux_model?` · shared ${job.shared_aux_source||'on'}`:''; jobCounts.textContent=`accepted ${job.accepted||0} · review ${job.needs_review||0} · rejected ${job.rejected||0} · failed ${job.failed||0} · concurrency ${job.concurrency||0} · ${trans} · translator ${translator}${shared}`; renderLiveEvents(job)}
 async function pollJob(jobId){try{const job=await api('/api/jobs/'+jobId); renderJob(job); await loadStats(); if(!isActiveJob(job)){if(state.pollTimer) clearInterval(state.pollTimer); state.pollTimer=null; if(state.currentJob===jobId){rememberJob(null); localStorage.setItem(LAST_JOB_STORAGE_KEY,jobId)} genBtn.disabled=false; genBtn.innerHTML='生成 + 审核'; toast(job.status==='completed'?'生成任务完成':job.status==='interrupted'?'任务被服务重启中断':'生成任务失败'); await loadSamples()}else{genBtn.disabled=true; genBtn.innerHTML='<span class="spinner"></span> 生成中'}}catch(e){if(state.pollTimer) clearInterval(state.pollTimer); state.pollTimer=null; rememberJob(null); genBtn.disabled=false; genBtn.innerHTML='生成 + 审核'; toast('轮询任务失败：'+e.message)}}
 async function startPolling(jobId, showToast=false){rememberJob(jobId); if(state.pollTimer) clearInterval(state.pollTimer); genBtn.disabled=true; genBtn.innerHTML='<span class="spinner"></span> 生成中'; state.pollTimer=setInterval(()=>pollJob(jobId),1000); await pollJob(jobId); if(showToast) toast('已恢复任务进度：'+jobId.slice(0,8))}
-async function resumeJob(){let jobId=localStorage.getItem(JOB_STORAGE_KEY); if(jobId){try{const job=await api('/api/jobs/'+jobId); renderJob(job); if(isActiveJob(job)){await startPolling(jobId,true); return}else{rememberJob(null); localStorage.setItem(LAST_JOB_STORAGE_KEY,jobId)}}catch(e){rememberJob(null)}} try{const active=await api('/api/jobs?active=true&limit=1'); if(active.items&&active.items.length){await startPolling(active.items[0].id,true); return}}catch(e){} try{const lastId=localStorage.getItem(LAST_JOB_STORAGE_KEY); const latest=lastId?await api('/api/jobs/'+lastId).catch(()=>null):(await api('/api/jobs?limit=1')).items?.[0]; if(latest){renderJob(latest)}}catch(e){}}
+async function resumeJob(){let jobId=localStorage.getItem(JOB_STORAGE_KEY); if(jobId){try{const job=await api('/api/jobs/'+jobId); renderJob(job); if(isActiveJob(job)){await startPolling(jobId,true); return}else{rememberJob(null); localStorage.setItem(LAST_JOB_STORAGE_KEY,jobId)}}catch(e){rememberJob(null)}} try{const active=await api('/api/jobs?active=true&limit=1'); if(active.items&&active.items.length){await startPolling(active.items[0].id,true); return}}catch(e){} /* 不再自动加载历史非活动 job，避免超大快照导致页面打开变慢。 */}
 async function generate(){const btn=genBtn; btn.disabled=true; btn.innerHTML='<span class="spinner"></span> 生成中'; clearLiveChat(); try{const seedVal=seed.value.trim(); const data=await api('/api/generate',{method:'POST',body:JSON.stringify({count:Number(count.value||5),concurrency:Number(concurrency.value||3),max_turns:Number(maxTurns.value||12),translate_to_zh:translateToZh.checked,same_aux_model:sameAuxModel.checked,teacher:endpoint('teacher'),simulator:endpoint('simulator'),translator:endpoint('translator'),judge:endpoint('judge'),use_judge:useJudge.checked,seed:seedVal?Number(seedVal):null})}); renderJob(data.job); toast('任务已启动：'+data.job_id.slice(0,8)); await startPolling(data.job_id,false)}catch(e){toast('生成启动失败：'+e.message); rememberJob(null); btn.disabled=false; btn.innerHTML='生成 + 审核'}}
 async function exportData(){try{const data=await api('/api/export',{method:'POST',body:JSON.stringify({target_model_key:targetModel.value,train_mode:trainMode.value,include_needs_review:includeReview.checked,only_dialogue_distillation:onlyDistill.checked})}); exportLinks.innerHTML=`导出 ${data.count} 条：<a href="${data.files.chatml}">train_chatml.jsonl</a><a href="${data.files.sharegpt}">train_sharegpt.jsonl</a><a href="${data.files.notebook}">train_sydney.ipynb</a>`; toast('导出完成')}catch(e){toast('导出失败：'+e.message)}}
 function escapeHtml(s){return String(s??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]))}
