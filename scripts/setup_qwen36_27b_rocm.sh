@@ -35,7 +35,7 @@ export PORT="${PORT:-8010}"
 export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3.6-27b-q8-gguf}"
 
 # 192GB 显存可尝试 Q8 + 较高 parallel/ctx；如 OOM，优先降 CTX_SIZE，然后降 PARALLEL 或改 Q6/Q5。
-export PARALLEL="${PARALLEL:-100}"
+export PARALLEL="${PARALLEL:-80}"
 export CTX_SIZE="${CTX_SIZE:-400000}"
 export BATCH_SIZE="${BATCH_SIZE:-512}"
 export UBATCH_SIZE="${UBATCH_SIZE:-512}"
@@ -74,3 +74,4 @@ CTX_SIZE=$CTX_SIZE
 EOF
 
 exec bash "$BASE_SCRIPT" "$@"
+
