@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
 # 云端全流程部署：
 #   Sydney source：llama.cpp + GGUF，127.0.0.1:8000
-#   Qwen3.6-27B-FP8：vLLM OpenAI-compatible API，127.0.0.1:8010
+#   Qwen3.6-27B：llama.cpp + GGUF，127.0.0.1:8010
 #   控制台：FastAPI，127.0.0.1:7860
 #   只暴露一个 Cloudflare Tunnel：控制台，不暴露模型端口
 #
 # 用法：
 #   REPO_URL=https://github.com/boooozhang2007/sydney.git bash scripts/deploy_cloud_full_rocm.sh
 #
-# 质量优先默认：QWEN_MS_MODEL_ID=Qwen/Qwen3.6-27B-FP8
+# 注意：Qwen 已从 vLLM/FP8 改为 GGUF/llama.cpp，避开 ROCm vLLM 的 gdn_attention_core hipErrorIllegalAddress。
 
 set -Eeuo pipefail
 
 APP_DIR="${APP_DIR:-/workspace/sydney_NEWBING}"
 REPO_URL="${REPO_URL:-}"
 GIT_BRANCH="${GIT_BRANCH:-main}"
-GIT_PROXY_PREFIX="${GIT_PROXY_PREFIX:-https://gh.llkk.cc/}"
+GIT_PROXY_PREFIX="${GIT_PROXY_PREFIX:-https://github.akams.cn/}"
 # 只加速 GitHub/Hugging Face；apt/pip 保持当前镜像环境默认源。
 HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 
@@ -27,29 +27,24 @@ QWEN_PORT="${QWEN_PORT:-8010}"
 APP_CONCURRENCY="${APP_CONCURRENCY:-100}"
 SYDNEY_PARALLEL="${SYDNEY_PARALLEL:-100}"
 SYDNEY_CTX_SIZE="${SYDNEY_CTX_SIZE:-400000}"
-
-# Qwen FP8 + vLLM 参数。
-QWEN_MS_MODEL_ID="${QWEN_MS_MODEL_ID:-Qwen/Qwen3.6-27B-FP8}"
-QWEN_MODEL_DIR="${QWEN_MODEL_DIR:-/workspace/modelscope/qwen36_27b_fp8}"
-# 注意：vLLM 的 gpu-memory-utilization 是按整卡总显存计算，不是按剩余显存计算。
-# 如果 Sydney llama.cpp 已占显存，0.92 会要求约 176GiB，可能启动失败；默认自动按剩余显存限幅。
-QWEN_GPU_MEMORY_UTILIZATION="${QWEN_GPU_MEMORY_UTILIZATION:-0.50}"
-QWEN_AUTO_MEMORY_UTIL="${QWEN_AUTO_MEMORY_UTIL:-1}"
-QWEN_MAX_MODEL_LEN="${QWEN_MAX_MODEL_LEN:-32768}"
-QWEN_MAX_NUM_SEQS="${QWEN_MAX_NUM_SEQS:-100}"
-QWEN_MAX_NUM_BATCHED_TOKENS="${QWEN_MAX_NUM_BATCHED_TOKENS:-131072}"
-QWEN_TENSOR_PARALLEL_SIZE="${QWEN_TENSOR_PARALLEL_SIZE:-1}"
-QWEN_DTYPE="${QWEN_DTYPE:-auto}"
-QWEN_SERVED_MODEL_NAME="${QWEN_SERVED_MODEL_NAME:-qwen3.6-27b-fp8}"
-VLLM_EXTRA_ARGS="${VLLM_EXTRA_ARGS:-}"
-# ROCm 上 torch.compile / cudagraph 偶发 hipErrorIllegalAddress，默认关闭以换稳定性。
-QWEN_DISABLE_CUDA_GRAPH="${QWEN_DISABLE_CUDA_GRAPH:-1}"
-QWEN_ENFORCE_EAGER="${QWEN_ENFORCE_EAGER:-1}"
-QWEN_USE_V1="${QWEN_USE_V1:-0}"
-QWEN_CLEAR_COMPILE_CACHE="${QWEN_CLEAR_COMPILE_CACHE:-1}"
-SKIP_VLLM_CHECK="${SKIP_VLLM_CHECK:-0}"
-
 SYDNEY_MODEL_LOCAL_FILE="${SYDNEY_MODEL_LOCAL_FILE:-}"
+
+# Qwen GGUF + llama.cpp 参数。
+# 如果默认仓库/文件名与你实际使用的不一致，设置 QWEN_GGUF_REPO_ID/QWEN_GGUF_MODEL_NAME，或直接上传并设置 QWEN_MODEL_LOCAL_FILE=/mnt/xxx.gguf。
+QWEN_WORKDIR="${QWEN_WORKDIR:-/workspace/qwen36_27b_rocm}"
+QWEN_GGUF_REPO_ID="${QWEN_GGUF_REPO_ID:-ggml-org/Qwen3.6-27B-GGUF}"
+QWEN_GGUF_MODEL_NAME="${QWEN_GGUF_MODEL_NAME:-Qwen3.6-27B-Q8_0.gguf}"
+QWEN_MODEL_PROVIDER="${QWEN_MODEL_PROVIDER:-${MODEL_PROVIDER:-auto}}" # auto / hf / modelscope
+QWEN_MS_GGUF_MODEL_ID="${QWEN_MS_GGUF_MODEL_ID:-}"
+QWEN_MS_GGUF_FILE_PATH="${QWEN_MS_GGUF_FILE_PATH:-$QWEN_GGUF_MODEL_NAME}"
+QWEN_MODEL_LOCAL_FILE="${QWEN_MODEL_LOCAL_FILE:-}"
+QWEN_SERVED_MODEL_NAME="${QWEN_SERVED_MODEL_NAME:-qwen3.6-27b-q8-gguf}"
+QWEN_PARALLEL="${QWEN_PARALLEL:-100}"
+QWEN_CTX_SIZE="${QWEN_CTX_SIZE:-400000}"
+QWEN_TEMP="${QWEN_TEMP:-0.55}"
+QWEN_TOP_P="${QWEN_TOP_P:-0.90}"
+QWEN_REPEAT_PENALTY="${QWEN_REPEAT_PENALTY:-1.08}"
+
 LLAMA_DIR="${LLAMA_DIR:-/workspace/llama.cpp-rocm}"
 
 CLOUDFLARED_LOCAL_PATH="${CLOUDFLARED_LOCAL_PATH:-/mnt/cloudflared}"
@@ -66,7 +61,7 @@ warn(){ printf '\033[1;33m[warn]\033[0m %s\n' "$*" >&2; }
 err(){ printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; }
 have(){ command -v "$1" >/dev/null 2>&1; }
 
-ensure_dirs(){ mkdir -p "$STACK_DIR" "$LOG_DIR" "$RUN_DIR" "$BIN_DIR" "$QWEN_MODEL_DIR"; }
+ensure_dirs(){ mkdir -p "$STACK_DIR" "$LOG_DIR" "$RUN_DIR" "$BIN_DIR" "$QWEN_WORKDIR"; }
 
 apt_install(){
   if have apt-get; then
@@ -79,29 +74,7 @@ apt_install(){
 
 pip_install(){
   log "安装/检查 Python 依赖，使用当前环境默认 pip 源"
-  # 只安装工作台轻量依赖；vLLM 环境按你的要求假设镜像已自带，不在这里 pip 安装/升级。
-  python3 -m pip install -U modelscope uvicorn fastapi python-dotenv httpx pydantic
-}
-
-check_vllm(){
-  if [[ "$SKIP_VLLM_CHECK" == "1" ]]; then
-    warn "已跳过 vLLM 检查：SKIP_VLLM_CHECK=1"
-    return 0
-  fi
-  log "检查当前环境 vLLM"
-  if ! python3 - <<'PY'
-import importlib.util, sys
-spec = importlib.util.find_spec('vllm')
-if spec is None:
-    print('vLLM not found', file=sys.stderr)
-    sys.exit(1)
-import vllm
-print('vLLM OK:', getattr(vllm, '__version__', 'unknown'))
-PY
-  then
-    err "当前 Python 环境没有可用 vLLM。请切换到自带 vLLM/ROCm 的镜像，或手动安装后重跑。"
-    exit 1
-  fi
+  python3 -m pip install -U uvicorn fastapi python-dotenv httpx pydantic
 }
 
 clone_or_update_repo(){
@@ -117,8 +90,8 @@ clone_or_update_repo(){
   fi
   mkdir -p "$(dirname "$APP_DIR")"
   log "克隆源码：$REPO_URL -> $APP_DIR"
-  git clone --depth 1 --branch "$GIT_BRANCH" "${GIT_PROXY_PREFIX}${REPO_URL}" "$APP_DIR" \
-    || git clone --depth 1 --branch "$GIT_BRANCH" "$REPO_URL" "$APP_DIR"
+  git -c http.version=HTTP/1.1 clone --depth 1 --branch "$GIT_BRANCH" "${GIT_PROXY_PREFIX}${REPO_URL}" "$APP_DIR" \
+    || git -c http.version=HTTP/1.1 clone --depth 1 --branch "$GIT_BRANCH" "$REPO_URL" "$APP_DIR"
 }
 
 install_repo_requirements(){
@@ -129,53 +102,26 @@ install_repo_requirements(){
   fi
 }
 
-modelscope_download_qwen_fp8(){
-  if [[ -f "$QWEN_MODEL_DIR/config.json" ]]; then
-    log "Qwen FP8 已存在：$QWEN_MODEL_DIR"
-    return 0
-  fi
-  log "用 ModelScope 下载 Qwen FP8：$QWEN_MS_MODEL_ID -> $QWEN_MODEL_DIR"
-  QWEN_MS_MODEL_ID="$QWEN_MS_MODEL_ID" QWEN_MODEL_DIR="$QWEN_MODEL_DIR" python3 - <<'PY'
-import os
-from pathlib import Path
-model_id = os.environ['QWEN_MS_MODEL_ID']
-local_dir = os.environ['QWEN_MODEL_DIR']
-Path(local_dir).mkdir(parents=True, exist_ok=True)
-try:
-    from modelscope import snapshot_download
-except Exception:
-    from modelscope.hub.snapshot_download import snapshot_download
-
-for kwargs in (
-    dict(model_id=model_id, local_dir=local_dir),
-    dict(model_id=model_id, cache_dir=local_dir),
-):
-    try:
-        print('[modelscope] snapshot_download', kwargs, flush=True)
-        snapshot_download(**kwargs)
-        break
-    except TypeError:
-        continue
-PY
-  if [[ ! -f "$QWEN_MODEL_DIR/config.json" ]]; then
-    # 有些 modelscope 版本会下载到 local_dir/model_id 子目录，尝试自动定位。
-    local found
-    found="$(find "$QWEN_MODEL_DIR" -maxdepth 4 -name config.json -type f | head -n 1 || true)"
-    if [[ -n "$found" ]]; then
-      QWEN_MODEL_DIR="$(dirname "$found")"
-      log "自动定位 Qwen 模型目录：$QWEN_MODEL_DIR"
-    else
-      err "Qwen FP8 下载后未找到 config.json，请检查 QWEN_MS_MODEL_ID=$QWEN_MS_MODEL_ID"
-      exit 1
+stop_legacy_qwen_vllm(){
+  if [[ -f "$RUN_DIR/qwen-vllm.pid" ]]; then
+    local pid
+    pid="$(cat "$RUN_DIR/qwen-vllm.pid" 2>/dev/null || true)"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      warn "停止旧 vLLM Qwen 进程：PID=$pid"
+      kill "$pid" 2>/dev/null || true
+      sleep 2
+      kill -9 "$pid" 2>/dev/null || true
     fi
+    rm -f "$RUN_DIR/qwen-vllm.pid"
   fi
 }
 
 start_sydney(){
   cd "$APP_DIR"
-  log "启动 Sydney source 模型：127.0.0.1:$SYDNEY_PORT"
+  log "启动 Sydney source GGUF：127.0.0.1:$SYDNEY_PORT"
   MODEL_LOCAL_FILE="$SYDNEY_MODEL_LOCAL_FILE" \
   GITHUB_PROXY_PREFIX="$GIT_PROXY_PREFIX" \
+  HF_ENDPOINT="$HF_ENDPOINT" \
   WORKDIR=/workspace/sydney_rocm \
   LLAMA_DIR="$LLAMA_DIR" \
   PORT="$SYDNEY_PORT" \
@@ -185,104 +131,36 @@ start_sydney(){
   bash scripts/setup_sydney_rocm.sh --restart
 }
 
-detect_qwen_gpu_memory_utilization(){
-  if [[ "$QWEN_AUTO_MEMORY_UTIL" != "1" ]]; then
-    echo "$QWEN_GPU_MEMORY_UTILIZATION"
-    return 0
-  fi
-  python3 - <<PY
-import os
-fallback = float(os.environ.get('QWEN_GPU_MEMORY_UTILIZATION', '0.50'))
-try:
-    import torch
-    if not torch.cuda.is_available():
-        print(fallback); raise SystemExit
-    free, total = torch.cuda.mem_get_info()
-    free_gib = free / 1024**3
-    total_gib = total / 1024**3
-    # vLLM 检查 requested = total * util，必须小于启动时 free。
-    # 留 8GiB 给框架/碎片/后续波动。
-    util = max(0.10, min(fallback, (free_gib - 8.0) / total_gib))
-    print(f"{util:.3f}")
-except Exception:
-    print(fallback)
-PY
-}
-
-start_qwen_vllm(){
-  modelscope_download_qwen_fp8
-  # 如果上次 hip illegal memory access 失败，旧进程/缓存可能污染后续启动。
-  if [[ -f "$RUN_DIR/qwen-vllm.pid" ]] && ! kill -0 "$(cat "$RUN_DIR/qwen-vllm.pid")" 2>/dev/null; then
-    rm -f "$RUN_DIR/qwen-vllm.pid"
-  fi
-  if [[ "$QWEN_CLEAR_COMPILE_CACHE" == "1" ]]; then
-    rm -rf /root/.cache/vllm/torch_compile_cache 2>/dev/null || true
-  fi
-  if [[ -f "$RUN_DIR/qwen-vllm.pid" ]] && kill -0 "$(cat "$RUN_DIR/qwen-vllm.pid")" 2>/dev/null; then
-    log "Qwen vLLM 已在运行：PID=$(cat "$RUN_DIR/qwen-vllm.pid")"
-    return 0
-  fi
-  local effective_gpu_util
-  effective_gpu_util="$(detect_qwen_gpu_memory_utilization)"
-  log "启动 Qwen3.6-27B-FP8 vLLM：127.0.0.1:$QWEN_PORT"
-  log "model=$QWEN_MODEL_DIR max_model_len=$QWEN_MAX_MODEL_LEN max_num_seqs=$QWEN_MAX_NUM_SEQS gpu_memory_utilization=$effective_gpu_util"
-  export HF_ENDPOINT="$HF_ENDPOINT"
-  export VLLM_USE_MODELSCOPE="True"
-  export VLLM_USE_V1="$QWEN_USE_V1"
-  export PYTORCH_HIP_ALLOC_CONF="${PYTORCH_HIP_ALLOC_CONF:-expandable_segments:True}"
-  export RCCL_MSCCL_ENABLE="${RCCL_MSCCL_ENABLE:-0}"
-  local vllm_args=(
-    --host 127.0.0.1
-    --port "$QWEN_PORT"
-    --model "$QWEN_MODEL_DIR"
-    --served-model-name "$QWEN_SERVED_MODEL_NAME"
-    --dtype "$QWEN_DTYPE"
-    --tensor-parallel-size "$QWEN_TENSOR_PARALLEL_SIZE"
-    --gpu-memory-utilization "$effective_gpu_util"
-    --max-model-len "$QWEN_MAX_MODEL_LEN"
-    --max-num-seqs "$QWEN_MAX_NUM_SEQS"
-    --max-num-batched-tokens "$QWEN_MAX_NUM_BATCHED_TOKENS"
-  )
-  if [[ "$QWEN_ENFORCE_EAGER" == "1" ]]; then
-    vllm_args+=(--enforce-eager)
-  fi
-  if [[ "$QWEN_DISABLE_CUDA_GRAPH" == "1" ]]; then
-    vllm_args+=(--disable-cudagraph)
-  fi
-  if [[ -n "$VLLM_EXTRA_ARGS" ]]; then
-    # shellcheck disable=SC2206
-    extra_args=( $VLLM_EXTRA_ARGS )
-    vllm_args+=("${extra_args[@]}")
-  fi
-  log "vLLM args: ${vllm_args[*]}"
-  nohup python3 -m vllm.entrypoints.openai.api_server "${vllm_args[@]}" \
-    > "$LOG_DIR/qwen-vllm.log" 2>&1 &
-  echo $! > "$RUN_DIR/qwen-vllm.pid"
-  for i in {1..900}; do
-    if curl -fsS "http://127.0.0.1:$QWEN_PORT/v1/models" >/dev/null 2>&1; then
-      log "Qwen vLLM 已就绪"
-      return 0
-    fi
-    if ! kill -0 "$(cat "$RUN_DIR/qwen-vllm.pid")" 2>/dev/null; then
-      rm -f "$RUN_DIR/qwen-vllm.pid"
-      err "Qwen vLLM 启动失败，最近日志："
-      tail -n 120 "$LOG_DIR/qwen-vllm.log" || true
-      echo >&2
-      err "如果是 Free memory 错误：降低 QWEN_GPU_MEMORY_UTILIZATION，或先降低/停止 Sydney：/workspace/sydney_rocm/bin/stop_sydney_server.sh"
-      err "如果是 hipErrorIllegalAddress：保持 QWEN_USE_V1=0 QWEN_ENFORCE_EAGER=1 QWEN_DISABLE_CUDA_GRAPH=1；必要时降低 QWEN_MAX_NUM_SEQS/批量 tokens。"
-      exit 1
-    fi
-    sleep 2
-  done
-  err "Qwen vLLM 启动超时，日志：$LOG_DIR/qwen-vllm.log"
-  tail -n 120 "$LOG_DIR/qwen-vllm.log" || true
-  exit 1
+start_qwen_gguf(){
+  cd "$APP_DIR"
+  stop_legacy_qwen_vllm
+  log "启动 Qwen3.6 GGUF：127.0.0.1:$QWEN_PORT"
+  log "provider=$QWEN_MODEL_PROVIDER hf_repo=$QWEN_GGUF_REPO_ID ms_model=${QWEN_MS_GGUF_MODEL_ID:-<empty>} file=$QWEN_GGUF_MODEL_NAME parallel=$QWEN_PARALLEL ctx=$QWEN_CTX_SIZE"
+  HF_ENDPOINT="$HF_ENDPOINT" \
+  GITHUB_PROXY_PREFIX="$GIT_PROXY_PREFIX" \
+  WORKDIR="$QWEN_WORKDIR" \
+  LLAMA_DIR="$LLAMA_DIR" \
+  MODEL_PROVIDER="$QWEN_MODEL_PROVIDER" \
+  MODELSCOPE_MODEL_ID="$QWEN_MS_GGUF_MODEL_ID" \
+  MODELSCOPE_FILE_PATH="$QWEN_MS_GGUF_FILE_PATH" \
+  HF_REPO_ID="$QWEN_GGUF_REPO_ID" \
+  MODEL_NAME="$QWEN_GGUF_MODEL_NAME" \
+  MODEL_LOCAL_FILE="$QWEN_MODEL_LOCAL_FILE" \
+  SERVED_MODEL_NAME="$QWEN_SERVED_MODEL_NAME" \
+  PORT="$QWEN_PORT" \
+  PARALLEL="$QWEN_PARALLEL" \
+  CTX_SIZE="$QWEN_CTX_SIZE" \
+  TEMP="$QWEN_TEMP" \
+  TOP_P="$QWEN_TOP_P" \
+  REPEAT_PENALTY="$QWEN_REPEAT_PENALTY" \
+  USE_TUNNEL=0 \
+  bash scripts/setup_qwen36_27b_rocm.sh --restart
 }
 
 write_cloud_env(){
   cd "$APP_DIR"
   if [[ -f .env ]]; then cp .env ".env.backup.$(date +%Y%m%d_%H%M%S)" || true; fi
-  log "写入云端 .env：Sydney source + Qwen FP8(vLLM) aux 全复用"
+  log "写入云端 .env：Sydney source + Qwen GGUF aux 全复用"
   cat > .env <<EOF
 TEACHER_BASE_URL=http://127.0.0.1:$SYDNEY_PORT/v1
 TEACHER_API_KEY=sk-local
@@ -317,7 +195,6 @@ APP_DEFAULT_TRAIN_MODE=qlora
 APP_DEFAULT_INCLUDE_NEEDS_REVIEW=false
 APP_DEFAULT_ONLY_DIALOGUE_DISTILLATION=true
 
-# vLLM 启动内存策略：QWEN_AUTO_MEMORY_UTIL=1 时脚本会按剩余显存自动降低 gpu_memory_utilization。
 MODEL_TIMEOUT=600
 MODEL_RETRIES=3
 MODEL_RETRY_BACKOFF=2
@@ -411,24 +288,13 @@ write_management_scripts(){
   cat > "$BIN_DIR/status_all.sh" <<EOF
 #!/usr/bin/env bash
 set -e
-[[ -x /workspace/sydney_rocm/bin/status_sydney_server.sh ]] && /workspace/sydney_rocm/bin/status_sydney_server.sh || true
-for name in qwen-vllm app cloudflared; do
-  pid_file="$RUN_DIR/\$name.pid"
-  if [[ -f "\$pid_file" ]] && kill -0 "\$(cat "\$pid_file")" 2>/dev/null; then
-    echo "\$name: running PID=\$(cat "\$pid_file")"
-  else
-    echo "\$name: stopped"
-  fi
-done
-curl -fsS http://127.0.0.1:$QWEN_PORT/v1/models || true
-curl -fsS http://127.0.0.1:$APP_PORT/api/config >/dev/null && echo "app ok: http://127.0.0.1:$APP_PORT" || true
-grep -oE 'https://[-a-zA-Z0-9.]+trycloudflare.com' "$LOG_DIR/cloudflared-console.log" 2>/dev/null | tail -n 1 || true
+bash "$APP_DIR/scripts/manage_cloud_models.sh" status
 EOF
   cat > "$BIN_DIR/stop_all.sh" <<EOF
 #!/usr/bin/env bash
 set -e
-[[ -x /workspace/sydney_rocm/bin/stop_sydney_server.sh ]] && /workspace/sydney_rocm/bin/stop_sydney_server.sh || true
-for name in cloudflared app qwen-vllm; do
+bash "$APP_DIR/scripts/manage_cloud_models.sh" stop-all
+for name in cloudflared app; do
   pid_file="$RUN_DIR/\$name.pid"
   if [[ -f "\$pid_file" ]]; then
     pid="\$(cat "\$pid_file")"
@@ -446,24 +312,25 @@ main(){
   ensure_dirs
   apt_install
   pip_install
-  check_vllm
   clone_or_update_repo
   install_repo_requirements
   write_management_scripts
+  start_qwen_gguf
   start_sydney
-  start_qwen_vllm
   write_cloud_env
   start_app
   start_console_tunnel
   echo
   echo "管理命令："
+  echo "  bash $APP_DIR/scripts/manage_cloud_models.sh status"
+  echo "  bash $APP_DIR/scripts/manage_cloud_models.sh restart-qwen"
   echo "  $BIN_DIR/status_all.sh"
   echo "  $BIN_DIR/stop_all.sh"
   echo "日志："
   echo "  tail -f $LOG_DIR/app.log"
-  echo "  tail -f $LOG_DIR/qwen-vllm.log"
   echo "  tail -f $LOG_DIR/cloudflared-console.log"
   echo "  tail -f /workspace/sydney_rocm/logs/llama-server.log"
+  echo "  tail -f $QWEN_WORKDIR/logs/llama-server.log"
 }
 
 main "$@"

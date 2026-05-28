@@ -22,6 +22,9 @@
 #   WORKDIR=/workspace/sydney_rocm
 #   MODEL_URL=https://hf-mirror.com/FPHam/Clever_Sydney-4_12b_GGUF/resolve/main/Clever_Sydney-4_12b_Q8_0_o.gguf
 #   HF_ENDPOINT=https://hf-mirror.com
+#   MODEL_PROVIDER=auto        # auto / hf / modelscope
+#   MODELSCOPE_MODEL_ID=xxx/yyy
+#   MODELSCOPE_FILE_PATH=xxx.gguf
 #   MODEL_NAME=Clever_Sydney-4_12b_Q8_0_o.gguf
 #   MODEL_LOCAL_FILE=/mnt/Clever_Sydney-4_12b_Q8_0_o.gguf
 #   MODEL_LOCAL_SEARCH_DIRS=/mnt /mnt/data /workspace /root
@@ -47,12 +50,16 @@ LOG_DIR="${LOG_DIR:-$WORKDIR/logs}"
 RUN_DIR="${RUN_DIR:-$WORKDIR/run}"
 BIN_DIR="${BIN_DIR:-$WORKDIR/bin}"
 
+MODEL_NAME="${MODEL_NAME:-Clever_Sydney-4_12b_Q8_0_o.gguf}"
 HF_REPO_ID="${HF_REPO_ID:-FPHam/Clever_Sydney-4_12b_GGUF}"
 HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+MODEL_PROVIDER="${MODEL_PROVIDER:-auto}" # auto / hf / modelscope
+MODELSCOPE_MODEL_ID="${MODELSCOPE_MODEL_ID:-}"
+MODELSCOPE_FILE_PATH="${MODELSCOPE_FILE_PATH:-$MODEL_NAME}"
+MODELSCOPE_REVISION="${MODELSCOPE_REVISION:-master}"
 # GitHub 加速只用于克隆 llama.cpp；不改 apt/pip 等其他源。
 GITHUB_PROXY_PREFIX="${GITHUB_PROXY_PREFIX:-https://gh.llkk.cc/}"
 LLAMA_CPP_REPO="${LLAMA_CPP_REPO:-https://github.com/ggml-org/llama.cpp.git}"
-MODEL_NAME="${MODEL_NAME:-Clever_Sydney-4_12b_Q8_0_o.gguf}"
 MODEL_URL="${MODEL_URL:-$HF_ENDPOINT/$HF_REPO_ID/resolve/main/$MODEL_NAME}"
 # 备用源会按顺序尝试。国内环境默认优先 hf-mirror，失败后再试 Hugging Face 官方。
 MODEL_URL_FALLBACKS="${MODEL_URL_FALLBACKS:-$MODEL_URL https://huggingface.co/$HF_REPO_ID/resolve/main/$MODEL_NAME}"
@@ -301,6 +308,91 @@ download_with_hf_cli() {
     --local-dir "$MODEL_DIR" --local-dir-use-symlinks False
 }
 
+download_with_modelscope_cli() {
+  [[ "$MODEL_PROVIDER" == "modelscope" || "$MODEL_PROVIDER" == "auto" ]] || return 1
+  [[ -n "$MODELSCOPE_MODEL_ID" ]] || return 1
+  if ! have_cmd modelscope; then
+    return 1
+  fi
+  log "尝试 modelscope CLI 下载：$MODELSCOPE_MODEL_ID / $MODELSCOPE_FILE_PATH"
+  modelscope download \
+    --model "$MODELSCOPE_MODEL_ID" \
+    --revision "$MODELSCOPE_REVISION" \
+    --local_dir "$MODEL_DIR" \
+    "$MODELSCOPE_FILE_PATH"
+}
+
+download_with_modelscope_python() {
+  [[ "$MODEL_PROVIDER" == "modelscope" || "$MODEL_PROVIDER" == "auto" ]] || return 1
+  [[ -n "$MODELSCOPE_MODEL_ID" ]] || return 1
+  if ! have_cmd python3; then
+    return 1
+  fi
+  log "尝试 ModelScope Python 下载：$MODELSCOPE_MODEL_ID / $MODELSCOPE_FILE_PATH"
+  MODELSCOPE_MODEL_ID="$MODELSCOPE_MODEL_ID" \
+  MODELSCOPE_FILE_PATH="$MODELSCOPE_FILE_PATH" \
+  MODELSCOPE_REVISION="$MODELSCOPE_REVISION" \
+  MODEL_DIR="$MODEL_DIR" \
+  MODEL_PATH="$MODEL_PATH" \
+  python3 - <<'PY'
+import os
+import shutil
+from pathlib import Path
+
+model_id = os.environ["MODELSCOPE_MODEL_ID"]
+file_path = os.environ["MODELSCOPE_FILE_PATH"]
+revision = os.environ.get("MODELSCOPE_REVISION") or "master"
+model_dir = Path(os.environ["MODEL_DIR"])
+model_path = Path(os.environ["MODEL_PATH"])
+model_dir.mkdir(parents=True, exist_ok=True)
+
+try:
+    from modelscope import snapshot_download
+except Exception:
+    from modelscope.hub.snapshot_download import snapshot_download
+
+kwargs_list = [
+    dict(model_id=model_id, allow_file_pattern=file_path, local_dir=str(model_dir), revision=revision),
+    dict(model_id=model_id, allow_patterns=[file_path], local_dir=str(model_dir), revision=revision),
+    dict(model_id=model_id, local_dir=str(model_dir), revision=revision),
+    dict(model_id=model_id, cache_dir=str(model_dir), revision=revision),
+]
+
+last_error = None
+downloaded_root = None
+for kwargs in kwargs_list:
+    try:
+        print("[modelscope] snapshot_download", kwargs, flush=True)
+        downloaded_root = snapshot_download(**kwargs)
+        break
+    except TypeError as e:
+        last_error = e
+        continue
+    except Exception as e:
+        last_error = e
+        continue
+
+if downloaded_root is None:
+    raise RuntimeError(f"ModelScope download failed: {last_error}")
+
+candidates = []
+for root in [Path(downloaded_root), model_dir]:
+    candidates += [
+        root / file_path,
+        root / Path(file_path).name,
+    ]
+    candidates += list(root.rglob(Path(file_path).name))
+
+src = next((p for p in candidates if p.is_file() and p.stat().st_size > 1_000_000_000), None)
+if src is None:
+    raise FileNotFoundError(f"downloaded but cannot find large file: {file_path}")
+if src.resolve() != model_path.resolve():
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src, model_path)
+print(f"[modelscope] ready: {model_path}", flush=True)
+PY
+}
+
 download_with_aria2_or_curl() {
   local url="$1"
   log "尝试下载源：$url"
@@ -402,13 +494,24 @@ download_model() {
     return 0
   fi
 
-  log "下载 Sydney GGUF 到：$MODEL_PATH"
-  log "默认国内镜像：$HF_ENDPOINT"
+  log "下载 GGUF 到：$MODEL_PATH"
+  log "下载策略：MODEL_PROVIDER=$MODEL_PROVIDER HF_ENDPOINT=$HF_ENDPOINT MODELSCOPE_MODEL_ID=${MODELSCOPE_MODEL_ID:-<empty>}"
 
-  # 先尝试 HF CLI + hf-mirror。失败不退出，继续 aria2/curl 直链。
-  download_with_hf_cli || warn "huggingface-cli 下载失败或不可用，切换到直链断点下载。"
+  if [[ "$MODEL_PROVIDER" == "modelscope" || "$MODEL_PROVIDER" == "auto" ]]; then
+    download_with_modelscope_cli || warn "modelscope CLI 下载失败或不可用，切换到 ModelScope Python。"
+    if ! model_file_ok; then
+      download_with_modelscope_python || warn "ModelScope Python 下载失败或不可用。"
+    fi
+  fi
 
-  if ! model_file_ok; then
+  if [[ "$MODEL_PROVIDER" == "hf" || "$MODEL_PROVIDER" == "auto" ]]; then
+    # 再尝试 HF CLI + hf-mirror。失败不退出，继续 aria2/curl 直链。
+    if ! model_file_ok; then
+      download_with_hf_cli || warn "huggingface-cli 下载失败或不可用，切换到直链断点下载。"
+    fi
+  fi
+
+  if [[ "$MODEL_PROVIDER" != "modelscope" && ! model_file_ok ]]; then
     # 去重后按顺序尝试所有 URL。
     local tried=""
     local url
@@ -680,6 +783,9 @@ main() {
   # pip 安装 huggingface_hub 不是强依赖；失败不影响 curl 下载。
   if have_cmd python3 && have_cmd pip3; then
     python3 -m pip install -q --upgrade huggingface_hub >/dev/null 2>&1 || true
+    if [[ "$MODEL_PROVIDER" == "modelscope" || "$MODEL_PROVIDER" == "auto" ]]; then
+      python3 -m pip install -q --upgrade modelscope >/dev/null 2>&1 || true
+    fi
   fi
 
   clone_or_update_llama_cpp
