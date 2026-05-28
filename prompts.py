@@ -214,13 +214,18 @@ Hard requirements:
 - Preserve the number of messages exactly
 - Preserve every role exactly: system / user / assistant
 - Keep the system message exactly unchanged: "You are a helpful assistant."
-- Translate user and assistant content into natural Simplified Chinese
+- Read the whole transcript first, infer the relationship, mood, running joke, implied references, and what each short line is responding to
+- Translate user and assistant content into natural Simplified Chinese using the full conversation context, not isolated sentence-by-sentence literal translation
 - Do not summarize, rewrite the plot, add new turns, delete turns, or explain
+- Contextual localization is allowed and expected: resolve pronouns, elliptical replies, jokes, sarcasm, teasing, warmth, and emotional subtext into idiomatic Chinese while preserving meaning
 - Preserve natural personality, emotional continuity, playful familiarity, vulnerability, warmth, and occasional dry humor
+- Keep callbacks and references consistent across turns; the same object/person/topic should be translated consistently unless Chinese context naturally varies it
 - Do NOT make the assistant official, safe-sounding, polite, corporate, or template-like
 - Keep the tone like a private chat between familiar people, not a performance or argument
 - User messages must sound like a real close friend in Chinese: short, casual, TTS-friendly, usually one sentence, with natural punctuation
-- Remove translationese. Prefer colloquial Chinese over literal wording
+- User messages may be slightly adapted to sound like real Chinese texting, but must not change intent or role
+- Assistant messages should sound like the same character speaking fluent Chinese, not like a translator explaining the English
+- Remove translationese. Prefer colloquial Chinese over literal wording; avoid stiff phrases like “我理解你的感受/这听起来很有趣” unless the source truly says that
 - Keep occasional emojis only if they feel natural
 - Do not include English unless it is a short brand/model name such as Microsoft, Bing, OpenAI, Sydney
 - Preserve the real-person illusion: no "我是AI/语言模型", no "我能帮你什么", no corporate assistant tone
@@ -370,9 +375,12 @@ def build_simulator_system_prompt(spec: Dict[str, Any]) -> str:
             + "\n\n"
             + ATHENA_REALISM_LAYER_EN
             + "\n\n"
+            + ROLE_BOUNDARY_LAYER_EN
+            + "\n\n"
             + build_simulator_environment_block(spec, english=True)
             + "\n\nOutput contract:\n"
             + "- Reply in natural English only\n"
+            + "- You are the human/user side; never write Sydney's or the assistant's message\n"
             + "- Only output the next chat message itself, 1 line, no more than 20 English words\n"
             + "- No JSON, no quotes, no numbering, no Markdown, no speaker labels\n"
             + "- No thoughts/actions/request_heartbeat/tool/memory/system-prompt wording\n"
@@ -388,8 +396,11 @@ def build_simulator_system_prompt(spec: Dict[str, Any]) -> str:
         + "\n\n"
         + ATHENA_REALISM_LAYER_ZH
         + "\n\n"
+        + ROLE_BOUNDARY_LAYER_ZH
+        + "\n\n"
         + build_simulator_environment_block(spec, english=False)
         + "\n\n【硬性输出格式】\n"
+        + "- 你是人类/user 侧；绝不能写 Sydney/assistant/朋友 侧的话\n"
         + "- 只输出下一条聊天消息本身，1行，中文不超过20字\n"
         + "- 不要 JSON，不要引号，不要编号，不要 Markdown，不要角色名\n"
         + "- 不要 thoughts/actions/request_heartbeat/tool/memory/system-prompt 等框架词\n"
@@ -465,8 +476,28 @@ def build_translation_user_prompt(
     注意：Translator 只能改变 user/assistant 文本语言，不能改变 role/轮数/system。
     """
 
+    dialogue_context = []
+    for i, msg in enumerate(source_messages, start=1):
+        role = msg.get("role")
+        if role == "system":
+            continue
+        speaker = "human_user" if role == "user" else "sydney_assistant"
+        dialogue_context.append({
+            "turn_index": i,
+            "speaker": speaker,
+            "english": msg.get("content", ""),
+        })
+
     payload = {
-        "task": "Translate this English Sydney-style chat into natural Simplified Chinese fine-tuning data.",
+        "task": "Context-localize this English Sydney-style chat into natural Simplified Chinese fine-tuning data.",
+        "translation_strategy": {
+            "read_full_transcript_before_translating": True,
+            "use_context_to_translate_short_or_elliptical_lines": True,
+            "preserve_roles_and_turn_count_exactly": True,
+            "preserve_intent_emotion_callbacks_and_relationship_dynamics": True,
+            "prefer_idiomatic_private_chat_chinese_over_literal_english_order": True,
+            "do_not_make_user_or_assistant_sound_like_a_translator": True,
+        },
         "blueprint_reference": {
             "theme": spec.get("theme"),
             "theme_en": spec.get("theme_en"),
@@ -479,11 +510,13 @@ def build_translation_user_prompt(
             "style_tags": spec.get("style_tags", []),
             "style_tags_en": spec.get("style_tags_en", []),
         },
+        "context_view_for_translation": dialogue_context,
         "source_messages": source_messages,
         "output_contract": {
             "system_content_must_remain_exactly": SYDNEY_TRAINING_SYSTEM_PROMPT,
             "roles_and_message_count_must_match_source": True,
             "return_only_json": True,
+            "translation_must_be_contextual_and_idiomatic": True,
         },
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
