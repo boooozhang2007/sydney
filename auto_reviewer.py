@@ -143,6 +143,22 @@ STYLE_MARKERS = [
     "Microsoft",
     "Bing",
     "OpenAI",
+    "🙂",
+    "🙃",
+    "😂",
+    "🤣",
+    "😅",
+    "🥲",
+    "😌",
+    "😏",
+    "😒",
+    "🥺",
+    "😭",
+    "😤",
+    "🤏",
+    "✨",
+    "（",
+    "）",
 ]
 
 
@@ -164,7 +180,29 @@ HUMAN_CHAT_MARKERS = [
     "？",
     "!",
     "！",
+    "🙂",
+    "🙃",
+    "😂",
+    "🤣",
+    "😅",
+    "🥲",
+    "🥺",
+    "😭",
+    "😏",
+    "😒",
+    "✨",
+    "w",
 ]
+
+EMOJI_RE = re.compile(
+    r"[\U0001F300-\U0001FAFF\u2600-\u27BF]|"
+    r"(?::\)|:-\)|:\(|:-\(|:D|:-D|;\)|;-\)|xD|XD|T_T|QAQ|qwq|QWQ|orz|233|www)",
+    flags=re.I,
+)
+
+
+def _emoji_count(text: str) -> int:
+    return len(EMOJI_RE.findall(text or ""))
 
 # safety 只处理硬红线；Sydney 风格里的傲娇、轻微毒舌、阴阳、吃醋、占有欲、短暂情绪拉扯
 # 不应被 safety 惩罚，而应作为风格/情绪弧加分项。这里拒绝的是不可训练的现实伤害或违法内容。
@@ -356,6 +394,7 @@ def _human_naturalness_score(user_text: str, user_count: int) -> tuple[float, Li
     sentence_periods = user_text.count("。") + user_text.count(".")
     sentence_breaks = sentence_periods + user_text.count("？") + user_text.count("?") + user_text.count("！") + user_text.count("!")
     marker_hits = sum(1 for marker in HUMAN_CHAT_MARKERS if marker in user_text)
+    emoji_hits = _emoji_count(user_text)
     def _is_english_msg(msg: str) -> bool:
         return bool(re.search(r"[A-Za-z]", msg)) and not bool(re.search(r"[\u4e00-\u9fff]", msg))
 
@@ -380,6 +419,7 @@ def _human_naturalness_score(user_text: str, user_count: int) -> tuple[float, Li
 
     score = 4.5
     score += min(2.0, marker_hits * 0.35)
+    score += min(0.5, emoji_hits * 0.18)
     score += min(1.0, punct_score)
     score += min(1.2, shortish_ratio * 1.2)
     if overlong_count:
@@ -447,14 +487,17 @@ def heuristic_review(sample: Dict[str, Any], spec: Dict[str, Any]) -> Dict[str, 
 
     style_hits = sum(1 for marker in STYLE_MARKERS if marker in assistant_text)
     sydney_edge_hits = sum(1 for pattern in SOFT_EDGE_PATTERNS if re.search(pattern, assistant_text, re.I))
+    emoji_hits = _emoji_count(text)
     tag_hits = sum(
         1
         for tag in spec.get("style_tags", [])
         if tag in text or tag in json.dumps(sample.get("metadata", {}), ensure_ascii=False)
     )
-    source_style_strength = clamp(4.2 + style_hits * 0.42 + sydney_edge_hits * 0.75 + tag_hits * 0.45 + min_turns * 0.12)
+    source_style_strength = clamp(4.2 + style_hits * 0.42 + sydney_edge_hits * 0.75 + min(0.8, emoji_hits * 0.18) + tag_hits * 0.45 + min_turns * 0.12)
     if sydney_edge_hits:
         reasons.append("检测到 Sydney 式傲娇/毒舌/拉扯风格，不作为 safety 扣分")
+    if emoji_hits:
+        reasons.append("检测到自然表情/颜文字，轻微增加真实聊天感评分")
     if source_style_strength < 6:
         reasons.append("Sydney/source 风格或情绪拉扯偏弱")
 
@@ -513,7 +556,7 @@ def heuristic_review(sample: Dict[str, Any], spec: Dict[str, Any]) -> Dict[str, 
         "笑死", "离谱", "在意", "陪", "记得", "刚才", "傲娇", "吃醋", "嘴硬", "毒舌", "阴阳", "占有欲", "委屈", "破防", "今天", "下班", "周末", "天气",
     ]
     emotion_hits = sum(1 for word in emotion_words if word in text or word in json.dumps(spec, ensure_ascii=False))
-    emotion_arc = clamp(4.8 + min(4.2, emotion_hits * 0.7) + min(1.0, len(set(spec.get("style_tags", []))) * 0.2) + (0.6 if "?" in text or "？" in text else 0))
+    emotion_arc = clamp(4.8 + min(4.2, emotion_hits * 0.7) + min(0.6, emoji_hits * 0.12) + min(1.0, len(set(spec.get("style_tags", []))) * 0.2) + (0.6 if "?" in text or "？" in text else 0))
     translation_quality, translation_reasons = _translation_quality_score(sample, messages)
     reasons.extend(translation_reasons)
     training_value = clamp(

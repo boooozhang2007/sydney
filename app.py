@@ -215,6 +215,10 @@ def app_defaults() -> Dict[str, Any]:
         "train_mode": env_str("APP_DEFAULT_TRAIN_MODE", "qlora"),
         "include_needs_review": env_bool("APP_DEFAULT_INCLUDE_NEEDS_REVIEW", False),
         "only_dialogue_distillation": env_bool("APP_DEFAULT_ONLY_DIALOGUE_DISTILLATION", True),
+        "source_prompt_mode": env_str("SOURCE_PROMPT_MODE", env_str("TEACHER_PROMPT_MODE", "legacy_chat")),
+        "source_use_default_stops": env_bool("SOURCE_USE_DEFAULT_STOPS", False),
+        "generation_preserve_length": env_bool("GENERATION_PRESERVE_LENGTH", True),
+        "generation_min_turns": env_int("GENERATION_MIN_TURNS", 6, 2, 20),
     }
 
 

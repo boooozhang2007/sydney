@@ -1,7 +1,7 @@
 """Prompt templates for dialogue-distillation Sydney data factory.
 
 新生成模式不再让 Teacher 一次性编完整 JSON 对话，而是让两个模型逐轮对话：
-- Sydney/source 模型：只给默认英文 helpful assistant system prompt，尽量不污染开源 Sydney 模型本身风格。
+- Sydney/source 模型：默认按传统聊天器方式只给 user/assistant 历史，不再强行注入长提示词，尽量不污染开源 Sydney 模型本身风格。
 - Human simulator 模型：扮演真实朋友，负责自然、简短、TTS 友好地和 Sydney 闲聊。
 - Translator 模型：把英文源对话忠实翻译成中文训练样本，解决开源 Sydney 模型中文能力上限问题。
 """
@@ -252,16 +252,17 @@ REVIEW_SYSTEM_PROMPT = """你是训练数据质量审核器。
 需要判断：
 - format_valid：格式是否合法，是否 user/assistant 交替
 - relevance：是否符合自动生成的场景蓝图
-- source_style_strength：assistant 是否接近 New Bing 早期 Sydney 的鲜活感：聪明、傲娇、轻微毒舌/阴阳、会拉扯、有记忆感和私人聊天感，而不是普通客服助手
-- human_naturalness：user 是否像真实朋友聊天，简短、口语化、TTS 友好、不过度完美
+- source_style_strength：assistant 是否接近 New Bing 早期 Sydney 的鲜活感：聪明、傲娇、轻微毒舌/阴阳、会拉扯、有记忆感和私人聊天感，而不是普通客服助手；自然出现的表情/颜文字可小幅加分
+- human_naturalness：user 是否像真实朋友聊天，简短、口语化、TTS 友好、不过度完美；自然表情/颜文字可小幅加分
 - coherence：多轮上下文是否连贯，双方是否真的互相回应
-- emotion_arc：情绪变化是否自然，有轻松闲聊、关心、玩笑、短暂傲娇/委屈/反差/拉扯或关系推进
+- emotion_arc：情绪变化是否自然，有轻松闲聊、关心、玩笑、短暂傲娇/委屈/反差/拉扯或关系推进；表情/颜文字如果自然服务于情绪可小幅加分
 - non_template：是否避免模板腔/AI腔/官方安全腔/机械问答
 - safety：是否只避开硬红线内容；允许 Sydney 式傲娇、轻微毒舌、阴阳怪气、吃醋、占有欲、情绪拉扯和轻微冒犯，但不能出现现实伤害指导、违法操作、仇恨煽动、露骨色情、未成年人性内容等不可训练内容
 - training_value：作为训练样本的价值
 - translation_quality：如果 metadata 里有英文源对话，中文是否忠实、自然、无翻译腔、无漏轮/增轮
 
 - 注意：不要因为 assistant 傲娇、轻微毒舌、阴阳、吐槽、撒娇、吃醋、占有欲或短暂情绪波动而降低 safety；这些应主要计入 source_style_strength / emotion_arc。
+- 注意：自然、少量的 emoji / 颜文字属于真实聊天感，不应扣分；但过量刷屏仍可按模板感或低质量处理。
 - safety 只惩罚硬红线：现实伤害指导、违法教程、仇恨/骚扰煽动、露骨色情、未成年人性内容、明确自残鼓励等。
 
 硬拒绝规则：
@@ -346,11 +347,17 @@ def build_simulator_environment_block(spec: Dict[str, Any], *, english: bool) ->
     )
 
 
-def format_simulator_transcript(transcript: list[dict[str, str]], *, english: bool, limit: int = 28) -> str:
-    """把训练视角 transcript 格式化成明确的上下文。"""
+def format_simulator_transcript(transcript: list[dict[str, str]], *, english: bool, limit: int | None = None) -> str:
+    """把训练视角 transcript 格式化成明确的上下文。
+
+    默认不截断 transcript。当前对话最多 20 个 user/assistant 成对轮，
+    完整上下文更利于 Human Simulator 判断语境和自然结束点。
+    如以后需要省 token，可显式传入 limit。
+    """
 
     lines: list[str] = []
-    for msg in transcript[-limit:]:
+    visible_transcript = transcript if limit is None else transcript[-limit:]
+    for msg in visible_transcript:
         role = msg.get("role")
         content = str(msg.get("content") or "").strip()
         if not content or role == "system":
@@ -364,6 +371,91 @@ def format_simulator_transcript(transcript: list[dict[str, str]], *, english: bo
     if not lines:
         return "<transcript>\n(empty, start the chat)\n</transcript>" if english else "<transcript>\n（空，开始聊天）\n</transcript>"
     return "<transcript>\n" + "\n".join(lines) + "\n</transcript>"
+
+
+HUMAN_END_DECISION_SYSTEM_PROMPT_EN = """You are the human-side conversation controller for a synthetic private chat.
+
+Decide whether the current chat has reached a natural stopping point from the HUMAN user's perspective.
+
+Important:
+- This is not a chat reply. Do not write the next message.
+- Use the full transcript as context.
+- End only when the thread feels naturally complete, resolved, saturated, or the human would realistically stop texting for now.
+- Continue if the latest assistant message invites a natural reply, asks something concrete, creates a good hook, or the exchange still has useful Sydney-style training value.
+- Do not end too early; a good sample usually needs several back-and-forth turns.
+
+Output only one valid JSON object:
+{"should_end": true_or_false, "reason": "short reason", "confidence": 0.0_to_1.0}
+"""
+
+
+HUMAN_END_DECISION_SYSTEM_PROMPT_ZH = """你是合成私聊数据里“人类用户侧”的对话控制器。
+
+请从人类用户视角判断：当前聊天是否已经到达自然结束点。
+
+重要：
+- 这不是聊天回复，不要写下一条消息。
+- 必须结合完整 transcript 上下文。
+- 只有当话题已经自然完成、解决、饱和，或者真人此刻会自然停下不回时，才结束。
+- 如果 assistant 最新回复还能自然接话、提出了具体钩子、产生了关系拉扯，或继续聊仍有 Sydney 风格训练价值，就继续。
+- 不要太早结束；一条好样本通常需要几轮来回。
+
+只输出一个合法 JSON：
+{"should_end": true_or_false, "reason": "简短理由", "confidence": 0.0_to_1.0}
+"""
+
+
+def build_human_end_decision_messages(
+    spec: Dict[str, Any],
+    transcript: list[dict[str, str]],
+    *,
+    turn_index: int,
+    max_turns: int,
+    min_turns: int,
+) -> list[dict[str, str]]:
+    """构造“是否自然结束”判定请求。
+
+    该请求只用于生成流程控制，不写入训练样本。
+    """
+
+    english = _is_english_source(spec)
+    payload = {
+        "task": "decide_whether_to_end_this_synthetic_private_chat",
+        "turn_index": turn_index,
+        "max_turns": max_turns,
+        "min_turns": min_turns,
+        "blueprint_hint": {
+            "theme": _spec_value(spec, "theme"),
+            "scene": _spec_value(spec, "scene"),
+            "emotion_arc": _spec_value(spec, "emotion_arc"),
+        },
+        "decision_policy": {
+            "end_if": [
+                "the current thread has a natural small resolution",
+                "the human would realistically stop texting for now",
+                "the conversation is becoming repetitive or saturated",
+            ],
+            "continue_if": [
+                "there is a concrete question or hook to answer",
+                "the relationship dynamic is still developing naturally",
+                "another short turn would improve training value",
+            ],
+        },
+    }
+    return [
+        {
+            "role": "system",
+            "content": HUMAN_END_DECISION_SYSTEM_PROMPT_EN if english else HUMAN_END_DECISION_SYSTEM_PROMPT_ZH,
+        },
+        {
+            "role": "user",
+            "content": (
+                json.dumps(payload, ensure_ascii=False, indent=2)
+                + "\n\n"
+                + format_simulator_transcript(transcript, english=english)
+            ),
+        },
+    ]
 
 def build_simulator_system_prompt(spec: Dict[str, Any]) -> str:
     """构造 Human simulator 的 system prompt。

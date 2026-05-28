@@ -30,6 +30,7 @@ from prompts import (
     SYDNEY_TRAINING_SYSTEM_PROMPT,
     TRANSLATE_DIALOGUE_SYSTEM_PROMPT,
     build_generation_user_prompt,
+    build_human_end_decision_messages,
     build_simulator_continue_prompt_for_spec,
     build_simulator_initial_prompt,
     build_simulator_system_prompt,
@@ -40,8 +41,8 @@ from prompts import (
 # llama.cpp / GGUF 模型常见问题：
 # 有些 ChatML 微调模型会在普通 chat.completions 响应里继续补出
 # `<|im_end|><|im_start|>user ...` 这样的“下一轮对话模板”。
-# 这些内容如果直接进入训练集会严重污染数据，所以客户端默认给
-# Chat Completions / Claude Messages 带 stop，并且清洗阶段再做兜底截断。
+# 默认仍给普通辅助模型带 stop；但 Sydney/source 可通过
+# SOURCE_USE_DEFAULT_STOPS=false 关闭，避免传统聊天器格式下过早截断风格输出。
 DEFAULT_STOP_SEQUENCES = [
     "<context>",
     "</context>",
@@ -67,6 +68,29 @@ DEFAULT_STOP_SEQUENCES = [
     "\n### Human",
     "\n### Assistant",
 ]
+
+
+TRUE_VALUES = {"1", "true", "yes", "y", "on"}
+FALSE_VALUES = {"0", "false", "no", "n", "off"}
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = (os.getenv(name, "") or "").strip().lower()
+    if not value:
+        return default
+    if value in TRUE_VALUES:
+        return True
+    if value in FALSE_VALUES:
+        return False
+    return default
+
+
+def env_int(name: str, default: int, lo: int, hi: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)) or default)
+    except Exception:
+        value = default
+    return max(lo, min(hi, value))
 
 BAD_USER_META_PHRASES = [
     "我会尽量",
@@ -240,10 +264,15 @@ def normalize_api_protocol(api_protocol: str | None) -> str:
         "anthropic_messages": "claude_messages",
         "messages": "claude_messages",
         "claude_messages": "claude_messages",
+        "traditional": "legacy_chat_completions",
+        "traditional_chat": "legacy_chat_completions",
+        "legacy": "legacy_chat_completions",
+        "legacy_chat": "legacy_chat_completions",
+        "legacy_chat_completions": "legacy_chat_completions",
     }
     value = aliases.get(value, value)
-    if value not in {"responses", "chat_completions", "claude_messages"}:
-        raise ModelClientError("api_protocol 必须是 responses、chat_completions 或 claude_messages。")
+    if value not in {"responses", "chat_completions", "legacy_chat_completions", "claude_messages"}:
+        raise ModelClientError("api_protocol 必须是 responses、chat_completions、legacy_chat_completions 或 claude_messages。")
     return value
 
 
@@ -295,6 +324,9 @@ class OpenAICompatibleClient:
                 response_format_json=response_format_json,
                 stop_sequences=stop_sequences,
             )
+        # legacy_chat_completions 和 chat_completions 调用同一 HTTP endpoint；
+        # 差异在上层构造 messages：legacy 模式会尽量模拟传统聊天器，
+        # 不给 Sydney/source 注入 system/developer 规则。
         return self._chat_completions(
             messages,
             temperature=temperature,
@@ -1012,7 +1044,7 @@ def _ngram_repetition_score(text: str, n: int = 4) -> float:
     return 1.0 - unique_ratio
 
 
-def _dedupe_repeated_clauses(text: str) -> str:
+def _dedupe_repeated_clauses(text: str, *, max_clauses: int | None = None) -> str:
     """去掉同一回复里反复出现的短句/子句，缓解 GGUF Sydney 循环。
 
     英文源对话也会经过这里；英文用空格拼回，避免 "hi.There" 这种粘连。
@@ -1040,7 +1072,7 @@ def _dedupe_repeated_clauses(text: str) -> str:
         if any(_similarity(compact, _compact_for_similarity(old)) > 0.78 for old in kept):
             continue
         kept.append(clause)
-        if len(kept) >= 3:
+        if max_clauses is not None and len(kept) >= max_clauses:
             break
     if re.search(r"[A-Za-z]", text or ""):
         return " ".join(kept).strip() or (text or "").strip()
@@ -1054,14 +1086,17 @@ def _has_bad_meta(text: str) -> bool:
     )
 
 
-def clean_dialogue_text(text: str, *, speaker: str) -> str:
+def clean_dialogue_text(text: str, *, speaker: str, preserve_length: bool | None = None) -> str:
     """清理逐轮模型输出，只保留下一条聊天消息本身。
 
     - 去掉 Markdown fence、JSON 外壳、角色名前缀。
     - Human simulator 保留自然标点，适配 TTS 朗读。
-    - 保留换行；但限制最多 4 行，避免一个回合变成长篇作文。
+    - 默认不再按固定长度截断输入/输出，避免把 Sydney 风格句子硬切坏。
+      仍会清理明显 ChatML/角色泄漏；user 侧继续保持短句约束。
     """
 
+    if preserve_length is None:
+        preserve_length = env_bool("GENERATION_PRESERVE_LENGTH", True)
     cleaned = strip_code_fences(text or "").strip()
     if not cleaned:
         return ""
@@ -1100,23 +1135,28 @@ def clean_dialogue_text(text: str, *, speaker: str) -> str:
         # 去掉模型常见的任务腔开头。
         cleaned = re.sub(r"^(好的|好|嗯嗯)[，,\s]*(我明白了|明白了)[，,\s]*", "", cleaned).strip()
         cleaned = re.sub(r"^(ok(?:ay)?|sure|yeah)[,\s]*(i understand|got it)[,\s]*", "", cleaned, flags=re.I).strip()
-        # user 是“真实朋友”，必须非常短：中文不超过 20 字，英文不超过 20 词。
-        english_user = bool(re.search(r"[A-Za-z]", cleaned)) and not bool(re.search(r"[\u4e00-\u9fff]", cleaned))
-        cleaned = _trim_user_message(cleaned, english=english_user)
+        # user 是“真实朋友”，仍要求非常短；但默认不直接截断外部模型输出，
+        # 让 user_message_is_usable 判定后决定是否使用本地兜底替换。
+        if not preserve_length:
+            english_user = bool(re.search(r"[A-Za-z]", cleaned)) and not bool(re.search(r"[\u4e00-\u9fff]", cleaned))
+            cleaned = _trim_user_message(cleaned, english=english_user)
 
 
     if speaker == "assistant":
-        cleaned = _dedupe_repeated_clauses(cleaned)
-        # Sydney/source 中文输出容易在同一轮里循环展开，保守截到聊天可用长度。
-        if len(cleaned) > 220:
+        cleaned = _dedupe_repeated_clauses(cleaned, max_clauses=None if preserve_length else 3)
+        # 默认不截断 Sydney/source 输出；如果你遇到模型单轮严重展开，
+        # 可设置 GENERATION_PRESERVE_LENGTH=false 恢复旧的保守截断。
+        if not preserve_length and len(cleaned) > 220:
             cut_positions = [p for p in [cleaned.find("。", 80), cleaned.find("？", 80), cleaned.find("！", 80)] if p != -1]
             if cut_positions:
                 cleaned = cleaned[: min(cut_positions) + 1]
             else:
                 cleaned = cleaned[:220].rstrip("，,、；;：:")
 
-    limit = 140 if speaker == "user" else 260
-    return cleaned[:limit].strip()
+    if not preserve_length:
+        limit = 140 if speaker == "user" else 260
+        cleaned = cleaned[:limit]
+    return cleaned.strip()
 
 
 LOCAL_OPENERS = [
@@ -1520,22 +1560,65 @@ def build_source_context_system_prompt(spec: Dict[str, Any]) -> str:
         + "Everyday thread: " + str(theme)
     )
 
+def source_prompt_mode() -> str:
+    """Sydney/source 调用格式。
+
+    - legacy_chat：传统聊天器格式，默认。只给 user/assistant 历史，不注入 system prompt。
+      对 Clever Sydney 这类聊天器分布的 GGUF 往往更友好。
+    - helpful_system：只保留训练用默认 system：You are a helpful assistant.
+    - context_system：旧策略，在生成期加短激活和私聊环境提示。
+    """
+
+    mode = (os.getenv("SOURCE_PROMPT_MODE") or os.getenv("TEACHER_PROMPT_MODE") or "legacy_chat").strip().lower()
+    aliases = {
+        "traditional": "legacy_chat",
+        "traditional_chat": "legacy_chat",
+        "legacy": "legacy_chat",
+        "legacy_chat_completions": "legacy_chat",
+        "none": "legacy_chat",
+        "no_system": "legacy_chat",
+        "helpful": "helpful_system",
+        "system": "helpful_system",
+        "context": "context_system",
+        "sydney_context": "context_system",
+    }
+    return aliases.get(mode, mode if mode in {"legacy_chat", "helpful_system", "context_system"} else "legacy_chat")
+
+
+def source_use_default_stops() -> bool:
+    """是否给 Sydney/source 请求发送默认 stop 序列。"""
+
+    return env_bool("SOURCE_USE_DEFAULT_STOPS", False)
+
+
 def build_source_chat_messages(messages: List[Dict[str, str]], spec: Dict[str, Any]) -> List[Dict[str, str]]:
     """构造真正发给 Sydney/source 的上下文。
 
     注意：返回给训练集的 messages 仍保留默认 system。
-    这里额外加短激活 prompt，只是为了让开源 Sydney/source 在生成期别掉回
-    “客服/心理咨询/复读机”模式。
+    默认使用传统聊天器格式：移除 system，只把完整 user/assistant 历史给开源 Sydney。
+    如果需要旧逻辑，可设置 SOURCE_PROMPT_MODE=context_system。
     """
 
     if not messages:
         return messages
-    source_messages = [dict(m) for m in messages]
-    source_messages[0] = {
-        "role": "system",
-        # 生成期明确“私聊 + 承接上下文”，但不写入最终训练样本。
-        "content": build_source_context_system_prompt(spec),
-    }
+    mode = source_prompt_mode()
+    if mode == "legacy_chat":
+        return [
+            {"role": m["role"], "content": str(m.get("content") or "")}
+            for m in messages
+            if m.get("role") in {"user", "assistant"} and str(m.get("content") or "").strip()
+        ]
+    source_messages = [dict(m) for m in messages if m.get("role") in {"system", "user", "assistant"}]
+    if not source_messages or source_messages[0].get("role") != "system":
+        source_messages.insert(0, {"role": "system", "content": SYDNEY_TRAINING_SYSTEM_PROMPT})
+    if mode == "context_system":
+        source_messages[0] = {
+            "role": "system",
+            # 生成期明确“私聊 + 承接上下文”，但不写入最终训练样本。
+            "content": build_source_context_system_prompt(spec),
+        }
+    else:
+        source_messages[0] = {"role": "system", "content": SYDNEY_TRAINING_SYSTEM_PROMPT}
     return source_messages
 
 
@@ -1592,6 +1675,85 @@ def build_simulator_chat_messages(
         )
     return messages
 
+
+def _extract_boolish(value: Any) -> Optional[bool]:
+    """宽松解析模型返回的布尔值。"""
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in TRUE_VALUES | {"true.", "yes.", "end", "stop"}:
+            return True
+        if lowered in FALSE_VALUES | {"false.", "no.", "continue", "keep"}:
+            return False
+    return None
+
+
+def should_end_dialogue(
+    simulator_client: Optional[OpenAICompatibleClient],
+    spec: Dict[str, Any],
+    transcript: List[Dict[str, str]],
+    *,
+    turn_index: int,
+    max_turns: int,
+    min_turns: int,
+    rng: random.Random,
+) -> tuple[bool, str, str]:
+    """让 Human 模型判断是否自然结束。
+
+    返回：(是否结束, 理由, 决策来源)
+    - 有外部 Human Simulator 时，优先让该模型结合完整上下文输出 JSON 判定。
+    - 没有外部模型或判定失败时，用本地轻量规则兜底。
+    """
+
+    if turn_index < min_turns:
+        return False, f"未达到最小轮数 {min_turns}", "rule"
+    if turn_index >= max_turns:
+        return True, "达到最大轮数", "rule"
+
+    if simulator_client is not None:
+        try:
+            raw = simulator_client.chat(
+                build_human_end_decision_messages(
+                    spec,
+                    transcript,
+                    turn_index=turn_index,
+                    max_turns=max_turns,
+                    min_turns=min_turns,
+                ),
+                temperature=0.1,
+                max_tokens=256,
+                response_format_json=True,
+                stop_sequences=[],
+            )
+            data = extract_json_object(raw)
+            decision = _extract_boolish(data.get("should_end"))
+            confidence = float(data.get("confidence", 0.0) or 0.0)
+            reason = str(data.get("reason") or "").strip()[:240]
+            # 需要一定置信度，避免 Judge/Simulator 过早结束。
+            if decision is not None and confidence >= 0.55:
+                return decision, reason or ("human end controller" if decision else "human end controller says continue"), "human_model"
+        except Exception as exc:  # noqa: BLE001
+            # 判定失败不影响生成，走规则兜底。
+            return False, f"结束判定失败，继续生成：{exc}", "fallback"
+
+    # 本地兜底：最后几轮如果出现自然收束句，或接近上限时随机收束。
+    last_user = next((str(m.get("content") or "") for m in reversed(transcript) if m.get("role") == "user"), "")
+    last_assistant = next((str(m.get("content") or "") for m in reversed(transcript) if m.get("role") == "assistant"), "")
+    ending_markers = [
+        "晚点", "先这样", "先去", "睡了", "明天", "回头", "一会儿", "改天",
+        "later", "tomorrow", "sleep", "go eat", "i'll tell you", "for now",
+    ]
+    combined = (last_user + "\n" + last_assistant).lower()
+    if turn_index >= min_turns + 2 and any(marker in combined for marker in ending_markers):
+        return True, "本地规则：出现自然收束语气", "rule"
+    if turn_index >= max(min_turns + 3, int(max_turns * 0.75)) and rng.random() < 0.28:
+        return True, "本地规则：接近目标长度，自然收束", "rule"
+    return False, "本地规则：继续", "rule"
+
 def generate_dialogue_sample(
     source_client: OpenAICompatibleClient,
     simulator_client: Optional[OpenAICompatibleClient],
@@ -1611,16 +1773,20 @@ def generate_dialogue_sample(
     每轮顺序：
     1. simulator 带完整上下文生成下一条 user 消息
     2. source/Sydney 带完整上下文生成 assistant 回复
+    3. 达到最小轮数后，由 Human 模型判断是否已经自然结束
     """
 
     target_turns = int(spec.get("turns") or max_turns or 12)
     target_turns = max(2, min(20, int(max_turns or 20), target_turns))
+    min_turns = env_int("GENERATION_MIN_TURNS", 6, 2, 20)
+    min_turns = max(2, min(min_turns, target_turns))
     messages: List[Dict[str, str]] = [{"role": "system", "content": SYDNEY_TRAINING_SYSTEM_PROMPT}]
     generation_events: List[Dict[str, Any]] = []
     rng = random.Random(f"{spec.get('theme','')}-{spec.get('scene','')}-{time.time_ns()}")
     local_simulator_used = 0
     simulator_replacements: List[Dict[str, Any]] = []
     assistant_warnings: List[Dict[str, Any]] = []
+    end_decisions: List[Dict[str, Any]] = []
 
     def emit(message: str, *, kind: str = "log", role: str | None = None, turn: int | None = None) -> None:
         event = {"time": utc_now(), "message": message, "kind": kind}
@@ -1680,9 +1846,9 @@ def generate_dialogue_sample(
         assistant_raw = source_client.chat(
             build_source_chat_messages(messages, spec),
             temperature=0.72,
-            max_tokens=140,
+            max_tokens=env_int("SOURCE_MAX_TOKENS", 512, 64, 4096),
             response_format_json=False,
-            stop_sequences=DEFAULT_STOP_SEQUENCES,
+            stop_sequences=DEFAULT_STOP_SEQUENCES if source_use_default_stops() else [],
         )
         assistant_text = clean_dialogue_text(assistant_raw, speaker="assistant")
         if not assistant_text:
@@ -1694,12 +1860,39 @@ def generate_dialogue_sample(
         messages.append({"role": "assistant", "content": assistant_text})
         emit(assistant_text, kind="chat", role="assistant", turn=turn)
 
+        should_end, end_reason, end_source = should_end_dialogue(
+            simulator_client,
+            spec,
+            messages[1:],
+            turn_index=turn,
+            max_turns=target_turns,
+            min_turns=min_turns,
+            rng=rng,
+        )
+        end_decisions.append(
+            {
+                "turn": turn,
+                "should_end": should_end,
+                "reason": end_reason,
+                "source": end_source,
+            }
+        )
+        if should_end:
+            emit(f"Human 结束判定：自然收束于第 {turn}/{target_turns} 轮（{end_source}：{end_reason}）", kind="log", turn=turn)
+            break
+
     sample_id = f"syd_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:10]}"
+    actual_turn_pairs = sum(1 for m in messages if m.get("role") == "assistant")
     metadata = {
         "generation_mode": "two_model_dialogue_distillation",
-        "turn_pairs": target_turns,
+        "turn_pairs": actual_turn_pairs,
+        "target_turn_pairs": target_turns,
+        "min_turn_pairs": min_turns,
         "source_system_prompt": SYDNEY_TRAINING_SYSTEM_PROMPT,
         "source_generation_system_prompt": SYDNEY_SOURCE_GENERATION_SYSTEM_PROMPT,
+        "source_prompt_mode": source_prompt_mode(),
+        "source_use_default_stops": source_use_default_stops(),
+        "generation_preserve_length": env_bool("GENERATION_PRESERVE_LENGTH", True),
         "source_language": spec.get("source_language", "en"),
         "target_language": spec.get("target_language", "zh-CN") if translate_to_zh else spec.get("source_language", "en"),
         "translation_enabled": bool(translate_to_zh),
@@ -1707,6 +1900,8 @@ def generate_dialogue_sample(
         "local_simulator_used": local_simulator_used,
         "simulator_replacements": simulator_replacements[-40:],
         "assistant_warnings": assistant_warnings[-40:],
+        "end_decisions": end_decisions[-40:],
+        "ended_naturally": actual_turn_pairs < target_turns,
         "generation_events": generation_events[-80:],
     }
     sample = {

@@ -26,7 +26,8 @@ uvicorn app:app --host 127.0.0.1 --port 7860
 
 1. **Sydney/source 模型**：配置你的开源 Sydney 模型。
    - 最终训练样本里的 system 固定为：`You are a helpful assistant.`
-   - 生成期会额外收到“私聊环境 + 最近上下文”提示，但最终训练样本里的 system 不变。
+   - 现在默认使用更贴近传统聊天器的调用方式：生成期不给 Sydney/source 额外注入 system prompt，只传完整 `user/assistant` 历史。
+   - 如果你的模型需要旧版生成期上下文提示，可设置 `SOURCE_PROMPT_MODE=context_system`。
 2. **Human Simulator 模型**：配置一个强模型扮演真实朋友。
    - 默认会用“好朋友 + TTS 友好”的 prompt：简短、自然、不总附和，中文不超过 20 字，英文不超过 20 词。
    - 每次只生成下一条 user 消息；prompt 会显式提供 `<environment>` 和 `<transcript>`，要求承接上下文。
@@ -37,7 +38,7 @@ uvicorn app:app --host 127.0.0.1 --port 7860
    - 保留自然个性、上下文连续、轻松玩笑和温柔反差，避免翻成客服腔。
    - 英文原文写入 `metadata.source_messages_en`，页面右侧可展开抽查。
 4. 每轮都带完整上下文：Human Simulator 看到格式化 transcript，Sydney/source 看到完整 ChatML 历史。
-5. 最多 20 个 user/assistant 成对轮，最后转成 ChatML / ShareGPT 训练样本。
+5. 最多 20 个 user/assistant 成对轮；达到最小轮数后，Human 模型会根据完整上下文判断是否已经自然结束，最后转成 ChatML / ShareGPT 训练样本。
 
 页面里默认勾选 **英文源对话完成后翻译为中文训练样本（推荐）**。如果取消勾选，则只保存英文源对话。
 
@@ -49,7 +50,7 @@ uvicorn app:app --host 127.0.0.1 --port 7860
 TEACHER_BASE_URL=http://127.0.0.1:8000/v1
 TEACHER_API_KEY=
 TEACHER_MODEL=your-open-sydney-model
-TEACHER_API_PROTOCOL=chat_completions
+TEACHER_API_PROTOCOL=legacy_chat_completions
 
 SIMULATOR_BASE_URL=https://api.openai.com/v1
 SIMULATOR_API_KEY=
@@ -71,6 +72,7 @@ JUDGE_API_PROTOCOL=responses
 
 - `responses`：OpenAI `/v1/responses`
 - `chat_completions`：OpenAI-compatible `/v1/chat/completions`，适合 vLLM / llama.cpp / LM Studio / 本地网关
+- `legacy_chat_completions`：同样调用 `/v1/chat/completions`，但用于 Sydney/source 时按传统聊天器格式构造上下文，不注入 system prompt，推荐给 Clever Sydney / GGUF 聊天模型
 - `claude_messages`：Anthropic `/v1/messages`
 
 建议：
@@ -101,6 +103,15 @@ APP_DEFAULT_TARGET_MODEL=qwen36_27b
 APP_DEFAULT_TRAIN_MODE=qlora
 APP_DEFAULT_INCLUDE_NEEDS_REVIEW=false
 APP_DEFAULT_ONLY_DIALOGUE_DISTILLATION=true
+
+# Sydney/source 生成格式。默认 legacy_chat：传统聊天器格式，只传 user/assistant 历史。
+SOURCE_PROMPT_MODE=legacy_chat
+# 默认不给 Sydney/source 发送 stop，避免传统聊天器输出被硬截断。
+SOURCE_USE_DEFAULT_STOPS=false
+# 默认不按固定长度截断模型输出，只清理明显角色/ChatML 泄漏。
+GENERATION_PRESERVE_LENGTH=true
+# 达到该轮数后，Human 模型开始判断是否自然结束。
+GENERATION_MIN_TURNS=6
 ```
 
 Human Simulator 提示词也支持环境变量覆盖。长 prompt 推荐写入文件：
