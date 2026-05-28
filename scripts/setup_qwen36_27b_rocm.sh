@@ -34,11 +34,14 @@ export WORKDIR="${WORKDIR:-/workspace/qwen36_27b_rocm}"
 export PORT="${PORT:-8010}"
 export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3.6-27b-q8-gguf}"
 
-# 192GB 显存可尝试 Q8 + 较高 parallel/ctx；如 OOM，优先降 CTX_SIZE，然后降 PARALLEL 或改 Q6/Q5。
+# 27B Q8 在 llama.cpp ROCm 的自动 fit 阶段较容易段错误/OOM；默认先保守启动。
+# 稳定后可逐步提高 PARALLEL/CTX_SIZE/BATCH_SIZE。
 export PARALLEL="${PARALLEL:-80}"
-export CTX_SIZE="${CTX_SIZE:-400000}"
+export CTX_SIZE="${CTX_SIZE:-262144}"
 export BATCH_SIZE="${BATCH_SIZE:-512}"
-export UBATCH_SIZE="${UBATCH_SIZE:-512}"
+export UBATCH_SIZE="${UBATCH_SIZE:-256}"
+export LLAMA_ARG_FIT="${LLAMA_ARG_FIT:-off}"
+export LLAMA_CONT_BATCHING="${LLAMA_CONT_BATCHING:-1}"
 export TEMP="${TEMP:-0.55}"
 export TOP_P="${TOP_P:-0.90}"
 export REPEAT_PENALTY="${REPEAT_PENALTY:-1.08}"
@@ -68,10 +71,12 @@ MODEL_NAME=$MODEL_NAME
 MODEL_LOCAL_FILE=${MODEL_LOCAL_FILE:-}
 PARALLEL=$PARALLEL
 CTX_SIZE=$CTX_SIZE
+BATCH_SIZE=$BATCH_SIZE
+UBATCH_SIZE=$UBATCH_SIZE
+LLAMA_ARG_FIT=$LLAMA_ARG_FIT
 
 如果默认 HF_REPO_ID/MODEL_NAME 不存在，请改成你实际的 Qwen3.6-27B GGUF 仓库和文件，
 或上传 GGUF 到 /mnt 并设置 MODEL_LOCAL_FILE=/mnt/xxx.gguf。
 EOF
 
 exec bash "$BASE_SCRIPT" "$@"
-

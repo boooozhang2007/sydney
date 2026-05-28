@@ -86,6 +86,9 @@ UBATCH_SIZE="${UBATCH_SIZE:-512}"
 TEMP="${TEMP:-0.82}"
 TOP_P="${TOP_P:-0.94}"
 REPEAT_PENALTY="${REPEAT_PENALTY:-1.16}"
+LLAMA_ARG_FIT="${LLAMA_ARG_FIT:-}"          # 例如：off，遇到 fitting params 段错误时使用
+LLAMA_CONT_BATCHING="${LLAMA_CONT_BATCHING:-1}"
+LLAMA_EXTRA_ARGS="${LLAMA_EXTRA_ARGS:-}"
 
 FORCE_REBUILD="${FORCE_REBUILD:-0}"
 USE_TUNNEL="${USE_TUNNEL:-0}"
@@ -563,6 +566,9 @@ UBATCH_SIZE="\${UBATCH_SIZE:-$UBATCH_SIZE}"
 TEMP="\${TEMP:-$TEMP}"
 TOP_P="\${TOP_P:-$TOP_P}"
 REPEAT_PENALTY="\${REPEAT_PENALTY:-$REPEAT_PENALTY}"
+LLAMA_ARG_FIT="\${LLAMA_ARG_FIT:-$LLAMA_ARG_FIT}"
+LLAMA_CONT_BATCHING="\${LLAMA_CONT_BATCHING:-$LLAMA_CONT_BATCHING}"
+LLAMA_EXTRA_ARGS="\${LLAMA_EXTRA_ARGS:-$LLAMA_EXTRA_ARGS}"
 USE_TUNNEL="\${USE_TUNNEL:-$USE_TUNNEL}"
 CLOUDFLARED_URL="${CLOUDFLARED_URL}"
 CLOUDFLARED_URL_FALLBACKS="${CLOUDFLARED_URL_FALLBACKS}"
@@ -581,7 +587,36 @@ if [[ -f "\$RUN_DIR/llama-server.pid" ]] && kill -0 "\$(cat "\$RUN_DIR/llama-ser
   echo "注意：修改 PARALLEL/CTX_SIZE 不会作用到已运行进程。请执行：$BIN_DIR/stop_sydney_server.sh && PARALLEL=8 CTX_SIZE=32768 $BIN_DIR/start_sydney_server.sh"
 else
   echo "启动 llama-server: http://127.0.0.1:\$PORT/v1"
-  echo "参数：CTX_SIZE=\$CTX_SIZE PARALLEL=\$PARALLEL BATCH_SIZE=\$BATCH_SIZE UBATCH_SIZE=\$UBATCH_SIZE"
+  echo "参数：CTX_SIZE=\$CTX_SIZE PARALLEL=\$PARALLEL BATCH_SIZE=\$BATCH_SIZE UBATCH_SIZE=\$UBATCH_SIZE LLAMA_ARG_FIT=\$LLAMA_ARG_FIT"
+  args=(
+    --host "\$HOST"
+    --port "\$PORT"
+    --model "\$MODEL_PATH"
+    --alias "\$SERVED_MODEL_NAME"
+    --ctx-size "\$CTX_SIZE"
+    --n-gpu-layers "\$GPU_LAYERS"
+    --parallel "\$PARALLEL"
+    --batch-size "\$BATCH_SIZE"
+    --ubatch-size "\$UBATCH_SIZE"
+    --temp "\$TEMP"
+    --top-p "\$TOP_P"
+    --repeat-penalty "\$REPEAT_PENALTY"
+  )
+  if [[ -n "\$LLAMA_ARG_FIT" ]]; then
+    args+=(-fit "\$LLAMA_ARG_FIT")
+  fi
+  if [[ "\$LLAMA_CONT_BATCHING" == "1" ]]; then
+    args+=(--cont-batching)
+  fi
+  if [[ -n "\$LLAMA_EXTRA_ARGS" ]]; then
+    # shellcheck disable=SC2206
+    extra=( \$LLAMA_EXTRA_ARGS )
+    args+=("\${extra[@]}")
+  fi
+  nohup "\$SERVER_BIN" "\${args[@]}" \
+    > "\$LOG_DIR/llama-server.log" 2>&1 &
+  echo \$! > "\$RUN_DIR/llama-server.pid"
+  : <<'OLD_DIRECT_ARGS_DISABLED'
   nohup "\$SERVER_BIN" \
     --host "\$HOST" \
     --port "\$PORT" \
@@ -598,6 +633,7 @@ else
     --cont-batching \
     > "\$LOG_DIR/llama-server.log" 2>&1 &
   echo \$! > "\$RUN_DIR/llama-server.pid"
+OLD_DIRECT_ARGS_DISABLED
 fi
 
 for i in {1..180}; do
