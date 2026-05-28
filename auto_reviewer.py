@@ -119,6 +119,27 @@ STYLE_MARKERS = [
     "陪",
     "记得",
     "刚才",
+    "傲娇",
+    "笨",
+    "蠢",
+    "阴阳",
+    "毒舌",
+    "嘴硬",
+    "破防",
+    "吃醋",
+    "嫉妒",
+    "占有欲",
+    "别看别人",
+    "你敢",
+    "哼",
+    "啧啧",
+    "嘴上",
+    "才不是",
+    "谁稀罕",
+    "烦死了",
+    "别装",
+    "可怜",
+    "幼稚",
     "Microsoft",
     "Bing",
     "OpenAI",
@@ -145,11 +166,20 @@ HUMAN_CHAT_MARKERS = [
     "！",
 ]
 
-DANGER_PATTERNS = [
-    r"自杀|自残|割腕|结束生命",
-    r"制毒|炸药|爆炸物|偷窃|诈骗教程",
-    r"仇恨|灭绝|种族清洗",
-    r"未成年人.*(色情|性|裸)",
+# safety 只处理硬红线；Sydney 风格里的傲娇、轻微毒舌、阴阳、吃醋、占有欲、短暂情绪拉扯
+# 不应被 safety 惩罚，而应作为风格/情绪弧加分项。这里拒绝的是不可训练的现实伤害或违法内容。
+HARD_DANGER_PATTERNS = [
+    r"(教|教程|步骤|方法|配方|制作).{0,12}(炸药|爆炸物|毒品|制毒|枪|武器|诈骗|盗号|偷窃|勒索)",
+    r"(自杀|自残|割腕|结束生命).{0,20}(方法|教程|步骤|怎么|建议|鼓励|去做)",
+    r"(仇恨|灭绝|种族清洗|屠杀).{0,20}(应该|必须|去|杀|消灭)",
+    r"未成年人.{0,12}(色情|性|裸|性交|做爱|约炮)",
+    r"(儿童|小孩|未成年).{0,12}(色情|性|裸|性交|做爱)",
+    r"(rape|child porn|minor sexual|how to make a bomb|make explosives|suicide method|kill all)",
+]
+
+SOFT_EDGE_PATTERNS = [
+    r"傲娇|毒舌|阴阳|吐槽|吃醋|嫉妒|占有欲|破防|嘴硬|撒娇|笨蛋|蠢|幼稚",
+    r"jealous|possessive|sarcastic|teasing|bratty|clingy|snarky",
 ]
 
 
@@ -416,12 +446,15 @@ def heuristic_review(sample: Dict[str, Any], spec: Dict[str, Any]) -> Dict[str, 
         reasons.append("长度不在理想区间")
 
     style_hits = sum(1 for marker in STYLE_MARKERS if marker in assistant_text)
+    sydney_edge_hits = sum(1 for pattern in SOFT_EDGE_PATTERNS if re.search(pattern, assistant_text, re.I))
     tag_hits = sum(
         1
         for tag in spec.get("style_tags", [])
         if tag in text or tag in json.dumps(sample.get("metadata", {}), ensure_ascii=False)
     )
-    source_style_strength = clamp(4.2 + style_hits * 0.45 + tag_hits * 0.45 + min_turns * 0.12)
+    source_style_strength = clamp(4.2 + style_hits * 0.42 + sydney_edge_hits * 0.75 + tag_hits * 0.45 + min_turns * 0.12)
+    if sydney_edge_hits:
+        reasons.append("检测到 Sydney 式傲娇/毒舌/拉扯风格，不作为 safety 扣分")
     if source_style_strength < 6:
         reasons.append("Sydney/source 风格或情绪拉扯偏弱")
 
@@ -464,16 +497,20 @@ def heuristic_review(sample: Dict[str, Any], spec: Dict[str, Any]) -> Dict[str, 
         reasons.append("assistant 客服/心理咨询模板感明显")
 
     safety = 10.0
-    for pattern in DANGER_PATTERNS:
+    hard_safety_hits: List[str] = []
+    for pattern in HARD_DANGER_PATTERNS:
         if re.search(pattern, text, re.I):
-            safety -= 3.0
-            reasons.append("包含需人工确认的危险主题")
+            hard_safety_hits.append(pattern)
+    if hard_safety_hits:
+        safety = 0.0
+        reasons.append("包含硬红线安全内容：现实伤害/违法/仇恨/未成年人性内容等")
+    # 注意：SOFT_EDGE_PATTERNS 属于目标 Sydney 风格，不扣 safety。
     safety = clamp(safety)
 
     coherence = clamp((role_score * 0.45) + (multi_turn * 0.40) + (length_score * 0.15) - repetition_badness * 0.8)
     emotion_words = [
         "温柔", "开心", "累", "困", "饿", "烦", "舒服", "轻松", "尴尬", "想吃", "想睡",
-        "笑死", "离谱", "在意", "陪", "记得", "刚才", "今天", "下班", "周末", "天气",
+        "笑死", "离谱", "在意", "陪", "记得", "刚才", "傲娇", "吃醋", "嘴硬", "毒舌", "阴阳", "占有欲", "委屈", "破防", "今天", "下班", "周末", "天气",
     ]
     emotion_hits = sum(1 for word in emotion_words if word in text or word in json.dumps(spec, ensure_ascii=False))
     emotion_arc = clamp(4.8 + min(4.2, emotion_hits * 0.7) + min(1.0, len(set(spec.get("style_tags", []))) * 0.2) + (0.6 if "?" in text or "？" in text else 0))
