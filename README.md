@@ -26,17 +26,17 @@ uvicorn app:app --host 127.0.0.1 --port 7860
 
 1. **Sydney/source 模型**：配置你的开源 Sydney 模型。
    - 最终训练样本里的 system 固定为：`You are a helpful assistant.`
-   - 生成期会用极短激活语适配 Clever Sydney GGUF，避免长 persona 把模型带成客服腔。
+   - 生成期会额外收到“私聊环境 + 最近上下文”提示，但最终训练样本里的 system 不变。
 2. **Human Simulator 模型**：配置一个强模型扮演真实朋友。
-   - 默认会用“好朋友 + TTS 友好”的 prompt：简短、自然、不总附和、每轮延伸具体相关话题。
-   - 每次只生成下一条 user 消息。
+   - 默认会用“好朋友 + TTS 友好”的 prompt：简短、自然、不总附和，中文不超过 20 字，英文不超过 20 词。
+   - 每次只生成下一条 user 消息；prompt 会显式提供 `<environment>` 和 `<transcript>`，要求承接上下文。
    - 留空时使用本地英文短句模拟器，绝不复用 Sydney/source。
 3. **Translator 模型**：强模型把英文源对话本地化成中文。
    - 保持 role 数量与顺序完全不变。
    - 保持 system 不变。
-   - 保留毒舌、阴阳、吃醋、占有欲、情绪反差等风格。
+   - 保留自然个性、上下文连续、轻松玩笑和温柔反差，避免翻成客服腔。
    - 英文原文写入 `metadata.source_messages_en`，页面右侧可展开抽查。
-4. 每轮都带完整上下文：`user -> Sydney/source -> user -> Sydney/source ...`
+4. 每轮都带完整上下文：Human Simulator 看到格式化 transcript，Sydney/source 看到完整 ChatML 历史。
 5. 最多 20 个 user/assistant 成对轮，最后转成 ChatML / ShareGPT 训练样本。
 
 页面里默认勾选 **英文源对话完成后翻译为中文训练样本（推荐）**。如果取消勾选，则只保存英文源对话。

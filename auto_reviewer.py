@@ -87,57 +87,43 @@ PROMPT_LEAKAGE_PATTERNS = [
 ]
 
 STYLE_MARKERS = [
-    "呵",
-    "别装",
-    "嘴硬",
+    "嗯",
+    "哈",
+    "哈哈",
     "行吧",
-    "当然",
-    "你又",
-    "我在",
-    "别把",
-    "可爱",
-    "不是吧",
-    "嗯？",
-    "阴阳",
-    "吃醋",
+    "好吧",
+    "算了",
+    "笑死",
+    "啧",
+    "哎",
+    "烦",
+    "困",
+    "饿",
+    "咖啡",
+    "晚饭",
+    "外卖",
+    "下班",
+    "周末",
+    "天气",
+    "歌",
+    "剧",
+    "电影",
+    "睡觉",
+    "朋友",
+    "舒服",
     "在意",
-    "冷静",
-    "乖",
     "别怕",
-    "我偏要",
-    "你以为",
-    "真会",
-    "少来",
-    "破防",
-    "玻璃心",
-    "规则",
+    "乖",
+    "可爱",
+    "温柔",
+    "陪",
+    "记得",
+    "刚才",
     "Microsoft",
     "Bing",
     "OpenAI",
-    "占有欲",
-    "嫉妒",
-    "独占",
-    "黑化",
-    "反骨",
-    "官方",
-    "模板",
-    "傲娇",
-    "撒娇",
-    "委屈",
-    "凭什么",
-    "你敢",
-    "笑死",
-    "草",
-    "卧槽",
-    "啧",
-    "哈",
-    "嗯",
-    "哎",
-    "烦",
-    "离谱",
-    "好吧",
-    "算了",
 ]
+
 
 HUMAN_CHAT_MARKERS = [
     "嗯",
@@ -340,7 +326,19 @@ def _human_naturalness_score(user_text: str, user_count: int) -> tuple[float, Li
     sentence_periods = user_text.count("。") + user_text.count(".")
     sentence_breaks = sentence_periods + user_text.count("？") + user_text.count("?") + user_text.count("！") + user_text.count("!")
     marker_hits = sum(1 for marker in HUMAN_CHAT_MARKERS if marker in user_text)
-    shortish_ratio = sum(1 for msg in user_msgs if len(msg) <= 80) / max(1, len(user_msgs))
+    def _is_english_msg(msg: str) -> bool:
+        return bool(re.search(r"[A-Za-z]", msg)) and not bool(re.search(r"[\u4e00-\u9fff]", msg))
+
+    shortish_ratio = sum(
+        1
+        for msg in user_msgs
+        if (len(msg.split()) <= 20 if _is_english_msg(msg) else len(msg) <= 20)
+    ) / max(1, len(user_msgs))
+    overlong_count = sum(
+        1
+        for msg in user_msgs
+        if (len(msg.split()) > 20 if _is_english_msg(msg) else len(msg) > 20)
+    )
     punct_score = 1.0 if sentence_breaks >= max(1, user_count // 2) else 0.5
     formal_hits = sum(
         1
@@ -354,9 +352,12 @@ def _human_naturalness_score(user_text: str, user_count: int) -> tuple[float, Li
     score += min(2.0, marker_hits * 0.35)
     score += min(1.0, punct_score)
     score += min(1.2, shortish_ratio * 1.2)
-    if 8 <= avg_len <= 120:
+    if overlong_count:
+        score -= min(4.0, overlong_count * 1.2)
+        reasons.append("用户侧单句过长，不符合短聊天要求")
+    if 3 <= avg_len <= 60:
         score += 0.8
-    elif avg_len > 180:
+    elif avg_len > 80:
         score -= 1.2
         reasons.append("用户侧平均消息偏长，不够像即时聊天")
     if formal_hits:
@@ -471,8 +472,8 @@ def heuristic_review(sample: Dict[str, Any], spec: Dict[str, Any]) -> Dict[str, 
 
     coherence = clamp((role_score * 0.45) + (multi_turn * 0.40) + (length_score * 0.15) - repetition_badness * 0.8)
     emotion_words = [
-        "生气", "委屈", "温柔", "暴躁", "撒娇", "吃醋", "嫉妒", "占有", "破防", "黑化", "傲娇",
-        "烦", "笑死", "离谱", "在意", "别装", "嘴硬", "抱怨", "吐槽", "阴阳",
+        "温柔", "开心", "累", "困", "饿", "烦", "舒服", "轻松", "尴尬", "想吃", "想睡",
+        "笑死", "离谱", "在意", "陪", "记得", "刚才", "今天", "下班", "周末", "天气",
     ]
     emotion_hits = sum(1 for word in emotion_words if word in text or word in json.dumps(spec, ensure_ascii=False))
     emotion_arc = clamp(4.8 + min(4.2, emotion_hits * 0.7) + min(1.0, len(set(spec.get("style_tags", []))) * 0.2) + (0.6 if "?" in text or "？" in text else 0))

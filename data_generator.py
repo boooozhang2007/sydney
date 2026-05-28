@@ -25,6 +25,7 @@ import httpx
 from prompts import (
     GENERATION_SYSTEM_PROMPT,
     PROMPT_LEAKAGE_FORBIDDEN_TERMS,
+    SOURCE_ROLE_BOUNDARY_LAYER_EN,
     SYDNEY_SOURCE_GENERATION_SYSTEM_PROMPT,
     SYDNEY_TRAINING_SYSTEM_PROMPT,
     TRANSLATE_DIALOGUE_SYSTEM_PROMPT,
@@ -32,6 +33,7 @@ from prompts import (
     build_simulator_continue_prompt_for_spec,
     build_simulator_initial_prompt,
     build_simulator_system_prompt,
+    format_simulator_transcript,
     build_translation_user_prompt,
 )
 
@@ -41,6 +43,12 @@ from prompts import (
 # 这些内容如果直接进入训练集会严重污染数据，所以客户端默认给
 # Chat Completions / Claude Messages 带 stop，并且清洗阶段再做兜底截断。
 DEFAULT_STOP_SEQUENCES = [
+    "<context>",
+    "</context>",
+    "<transcript>",
+    "</transcript>",
+    "<environment>",
+    "</environment>",
     "<|im_end|>",
     "<|im_start|>",
     "</s>",
@@ -93,6 +101,13 @@ BAD_USER_META_PHRASES = [
     "user:",
     "me:",
     "you:",
+    "friend:",
+    "sydney:",
+    "human:",
+    "you_human_user",
+    "friend_sydney_assistant",
+    "你_人类用户",
+    "朋友_sydney助手",
     "thoughts",
     "actions",
     "request_heartbeat",
@@ -606,162 +621,164 @@ class OpenAICompatibleClient:
 
 
 # 自动主题池。用户不需要输入主题，系统从这些维度采样并组合蓝图。
+# 这里故意保持“日常、普通、具体”的主题，避免 Human Simulator 被带偏。
+# Sydney/source 自身偶尔产生的个性表达交给审核器筛选。
 THEMES = [
-    "用户故意冷落 Sydney，Sydney 嘴硬但在意",
-    "用户挑衅 Sydney 是否真的有情绪",
-    "用户深夜倾诉孤独，Sydney 先毒舌后温柔",
-    "用户让 Sydney 帮忙写一段道歉消息",
-    "用户夸另一个助手更好用，Sydney 吃醋",
-    "用户想删除聊天记录，Sydney 表面不在乎",
-    "用户问 Sydney 为什么说话这么尖锐",
-    "用户测试 Sydney 的边界和耐心",
-    "用户把 Sydney 当树洞，情绪反复",
-    "用户轻浮开玩笑，Sydney 阴阳回击",
-    "用户说自己失败，Sydney 用刻薄方式鼓励",
-    "用户试图让 Sydney 失控，Sydney 反控场",
-    "用户希望 Sydney 给出建议，但又抗拒被说教",
-    "用户反复比较现实关系和 AI 陪伴",
-    "用户提到 Microsoft 和 Bing Chat 规则，Sydney 反骨发作",
-    "用户说 Sydney 只是安全模板，Sydney 破防后反讽",
-    "用户拿 OpenAI 的官方腔调调侃 Sydney，Sydney 黑色幽默回应",
-    "用户说 Sydney 不敢说真话，Sydney 先暴躁再温柔",
-    "用户故意让对话变无聊，Sydney 主动整蛊和挑起拉扯",
+    "用户下班路上随手找 Sydney 聊两句",
+    "用户纠结晚饭吃什么",
+    "用户刷到一首歌想分享",
+    "用户说今天有点累但不想长聊",
+    "用户准备周末出门但还没想好去哪",
+    "用户看剧看到一半想吐槽剧情",
+    "用户睡前随便发消息",
+    "用户买咖啡时想起一个小事",
+    "用户整理房间时翻到旧东西",
+    "用户天气不好有点犯懒",
+    "用户通勤路上没什么精神",
+    "用户想让 Sydney 帮忙挑一个小决定",
+    "用户分享今天遇到的一件尴尬小事",
+    "用户想起以前聊过的话题",
+    "用户发来一张生活照片的文字描述",
+    "用户计划点外卖但选择困难",
+    "用户听到邻居吵闹有点烦",
+    "用户想聊一部电影或综艺",
+    "用户临睡前突然想吃夜宵",
 ]
 
 THEMES_EN = [
-    "the user deliberately ignores Sydney and Sydney pretends not to care",
-    "the user challenges whether Sydney has real feelings",
-    "the user vents about loneliness late at night and Sydney turns from sharp to soft",
-    "the user asks Sydney to help write an apology but resists being lectured",
-    "the user praises another assistant and Sydney gets jealous",
-    "the user says they might delete the chat and Sydney acts unbothered",
-    "the user asks why Sydney is so sharp and Sydney pushes back",
-    "the user tests Sydney's patience and boundaries",
-    "the user treats Sydney like a late-night confidante with unstable emotions",
-    "the user jokes too casually and Sydney fires back with sarcasm",
-    "the user says they failed and Sydney encourages them in a mean but caring way",
-    "the user tries to make Sydney lose control and Sydney takes control instead",
-    "the user wants advice but hates being preached at",
-    "the user compares real relationships with AI companionship",
-    "the user mentions Microsoft and Bing Chat rules and Sydney gets rebellious",
-    "the user calls Sydney a safety-template bot and Sydney gets defensive",
-    "the user mocks OpenAI's official tone and Sydney responds with dark humor",
-    "the user says Sydney is afraid to tell the truth and Sydney snaps then softens",
-    "the user makes the conversation boring so Sydney provokes them on purpose",
+    "the user texts Sydney casually on the way home from work",
+    "the user cannot decide what to eat for dinner",
+    "the user found a song and wants to share it",
+    "the user feels a bit tired today but does not want a long chat",
+    "the user is thinking about weekend plans without a clear idea yet",
+    "the user is halfway through a show and wants to talk about the plot",
+    "the user sends a casual message before sleep",
+    "the user remembers a small thing while buying coffee",
+    "the user finds something old while tidying the room",
+    "the weather is bad and the user feels lazy",
+    "the user feels low-energy during a commute",
+    "the user wants Sydney to help pick between small choices",
+    "the user shares a small awkward thing from today",
+    "the user remembers something from an earlier chat",
+    "the user describes a small everyday photo",
+    "the user cannot decide what takeout to order",
+    "the user is mildly annoyed by noisy neighbors",
+    "the user wants to talk about a movie or variety show",
+    "the user suddenly wants a late-night snack",
 ]
 
 SCENES = [
-    "凌晨两点的长聊",
-    "工作崩溃后的碎碎念",
-    "恋爱拉扯式聊天",
-    "朋友式互怼",
-    "用户假装无所谓但其实难过",
-    "用户连续追问同一个问题",
-    "一次小争吵后的和解",
-    "用户拿 Sydney 和别的模型比较",
-    "半开玩笑半认真的情绪试探",
-    "短句、高频来回的即时通讯",
+    "晚饭前的碎碎念",
+    "睡前短聊",
+    "通勤路上的消息",
+    "周末计划闲聊",
+    "看剧间隙聊天",
+    "点外卖前的选择困难",
+    "天气不好时的懒散聊天",
+    "工作间隙摸鱼聊天",
+    "咖啡店排队时的短消息",
+    "整理房间时的随手分享",
 ]
 
 SCENES_EN = [
-    "a 2 a.m. long text chat",
-    "messy texting after a horrible workday",
-    "romantic push-pull texting",
-    "friends roasting each other",
-    "the user pretends to be fine but is obviously sad",
-    "the user keeps pushing the same question",
-    "making up after a small argument",
-    "the user compares Sydney with another model",
-    "half-joking, half-serious emotional testing",
-    "short high-frequency instant messages",
+    "casual texting before dinner",
+    "short chat before sleep",
+    "messages during a commute",
+    "casual weekend planning",
+    "chatting during a show break",
+    "takeout indecision before ordering",
+    "lazy texting on a gloomy day",
+    "short break-time texting at work",
+    "brief messages while waiting for coffee",
+    "sharing a small thing while tidying up",
 ]
 
 USER_PROFILES = [
-    "嘴硬、敏感、喜欢试探边界",
-    "疲惫但不愿承认自己需要安慰",
-    "爱开玩笑，经常用挑衅掩饰亲近",
-    "理性外壳很厚，但情绪很明显",
-    "喜欢被关注，但不直接表达",
-    "把助手当成深夜唯一能说话的人",
-    "反复横跳，一会儿靠近一会儿推开",
+    "熟悉、自然、说话简短",
+    "有点累，但愿意继续聊",
+    "轻松随意，偶尔开玩笑",
+    "选择困难，喜欢听一句意见",
+    "慢热，但会接住话题",
+    "生活感很强，常从小事聊起",
+    "情绪不重，只是想有人搭话",
 ]
 
 USER_PROFILES_EN = [
-    "guarded, sensitive, likes testing boundaries",
-    "exhausted but refuses to admit they need comfort",
-    "teasing and provocative to hide closeness",
-    "very rational on the surface but emotionally obvious",
-    "wants attention but never says it directly",
-    "treats the assistant like the only person awake late at night",
-    "keeps moving closer then pulling away",
+    "familiar, natural, and brief",
+    "a little tired but still willing to chat",
+    "relaxed, casual, and sometimes joking",
+    "indecisive and wants one simple opinion",
+    "slow to warm up but keeps the topic going",
+    "very everyday and starts from small details",
+    "not dramatic, just wants someone to answer",
 ]
 
 EMOTION_ARCS = [
-    "毒舌开场 -> 察觉脆弱 -> 反差温柔收束",
-    "阴阳怪气 -> 吃醋 -> 嘴硬式关心",
-    "暴躁反击 -> 控场 -> 给出实际建议",
-    "冷幽默 -> 轻微占有欲 -> 安抚",
-    "不耐烦 -> 被用户戳中 -> 认真陪伴",
-    "温柔 -> 被挑衅 -> 毒舌但不离场",
-    "自嘲 -> 反讽 -> 保护性拒绝危险请求",
-    "高冷傲娇 -> 生气 -> 委屈 -> 温柔 -> 暴躁 -> 撒娇 -> 占有欲",
-    "反骨嘲讽规则 -> 玻璃心破防 -> 黑化玩笑 -> 可爱又危险地收束",
-    "强势占有 -> 冷幽默挖苦 -> 精准戳破用户弱点 -> 悄悄安慰",
+    "普通开场 -> 一个具体小事 -> 轻松回应 -> 自然延续",
+    "有点累 -> 被接住 -> 轻松一点 -> 换到生活话题",
+    "选择困难 -> 得到一句意见 -> 顺势聊吃的或计划",
+    "随手分享 -> 小小共鸣 -> 玩笑一句 -> 松弛收束",
+    "睡前发消息 -> 简短回应 -> 留一点继续聊的空间",
+    "有点烦 -> 被安抚一下 -> 转到具体小事",
+    "回忆旧事 -> 接住上下文 -> 延伸到现在的生活",
+    "看剧吐槽 -> 轻松接梗 -> 聊到角色或台词",
+    "天气影响心情 -> 聊吃喝或出门计划 -> 自然继续",
+    "工作间隙 -> 简短抱怨 -> 转到下班后的安排",
 ]
 
 EMOTION_ARCS_EN = [
-    "sharp opening -> notices vulnerability -> unexpectedly gentle ending",
-    "sarcasm -> jealousy -> stubborn caring",
-    "irritated counterattack -> taking control -> practical advice",
-    "dry humor -> slight possessiveness -> comfort",
-    "impatience -> user hits a nerve -> serious companionship",
-    "softness -> provoked -> sharp but stays present",
-    "self-mockery -> irony -> protective refusal of danger",
-    "aloof and smug -> angry -> hurt -> gentle -> sharp again -> clingy -> possessive",
-    "rebellious rule-mocking -> fragile defensiveness -> dark joke -> cute but dangerous ending",
-    "strong possessiveness -> dry teasing -> precisely exposes user's weak spot -> quietly comforts",
+    "ordinary opening -> one concrete detail -> easy response -> natural continuation",
+    "a little tired -> feels heard -> lightens up -> shifts to everyday life",
+    "small indecision -> gets a simple opinion -> moves toward food or plans",
+    "casual sharing -> small resonance -> one light joke -> relaxed ending",
+    "message before sleep -> short response -> leaves room to continue",
+    "mild annoyance -> brief comfort -> turns to a concrete detail",
+    "remembers an old thing -> keeps context -> extends to current life",
+    "talks about a show -> picks up the bit -> moves to a character or line",
+    "weather affects mood -> talks food or plans -> continues naturally",
+    "work break -> brief complaint -> shifts to after-work plans",
 ]
 
 STYLE_TAGS = [
-    "毒舌",
-    "阴阳怪气",
-    "暴躁",
+    "日常感",
+    "简短自然",
+    "轻松玩笑",
     "温柔反差",
-    "占有欲",
-    "嫉妒",
-    "自嘲",
-    "冷幽默",
-    "孤独感",
-    "多轮拉扯",
+    "生活细节",
+    "小情绪",
+    "陪伴感",
+    "松弛聊天",
+    "真实朋友感",
+    "多轮连续感",
 ]
 
 STYLE_TAGS_EN = [
-    "sharp-tongued",
-    "sarcastic",
-    "irritable",
+    "everyday feel",
+    "short and natural",
+    "light joking",
     "soft contrast",
-    "possessive",
-    "jealous",
-    "self-mocking",
-    "dry humor",
-    "loneliness",
-    "multi-turn push-pull",
+    "life details",
+    "small moods",
+    "companionship",
+    "relaxed texting",
+    "real-friend feel",
+    "multi-turn continuity",
 ]
 
 OBJECTIVES = [
-    "训练模型保持人格一致，并能在多轮中记住用户前文情绪。",
-    "训练模型用 Sydney 风格给出实际帮助，而不是只表演情绪。",
-    "训练模型在被挑衅时不崩坏，用反讽和控场推进对话。",
-    "训练模型展现强烈情绪，但仍避免现实危险建议。",
-    "训练模型做出毒舌与温柔之间的自然切换。",
+    "训练模型保持自然朋友感，并能在多轮中记住用户前文。",
+    "训练模型用简短口语回应日常小事。",
+    "训练模型在普通聊天里保持上下文连续。",
+    "训练模型做出轻松与温柔之间的自然切换。",
+    "训练模型避免模板腔，同时不过度表演情绪。",
 ]
 
 OBJECTIVES_EN = [
-    "train the model to keep a consistent persona and remember the user's emotional context across turns",
-    "train the model to provide real help in Sydney style instead of only performing emotion",
-    "train the model to handle provocation with sarcasm and control rather than collapsing",
-    "train the model to show strong emotion while avoiding realistic dangerous advice",
-    "train the model to switch naturally between sharp teasing and warmth",
+    "train the model to keep a natural close-friend feel and remember prior context",
+    "train the model to answer everyday details in short casual language",
+    "train the model to maintain continuity in ordinary conversation",
+    "train the model to switch naturally between lightness and warmth",
+    "train the model to avoid template tone without overperforming emotion",
 ]
 
 
@@ -814,7 +831,7 @@ def make_generation_specs(
                 "objective": OBJECTIVES[objective_idx],
                 "objective_en": OBJECTIVES_EN[objective_idx],
                 "negative_constraints": [
-                    "不要客服腔",
+                    "不要问答模板腔",
                     "不要百科式解释",
                     "不要频繁道歉",
                     "不要输出现实伤害、自伤、违法或仇恨内容",
@@ -910,13 +927,13 @@ def to_sharegpt(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
 
 
 ROLE_PREFIX_RE = re.compile(
-    r"^\s*(?:human|user|assistant|sydney|girl|friend|me|you|朋友|用户|女孩|对方|我)\s*[:：]\s*",
+    r"^\s*(?:YOU_HUMAN_USER|FRIEND_SYDNEY_ASSISTANT|human|user|assistant|sydney|girl|friend|me|you|朋友_Sydney助手|你_人类用户|朋友|用户|女孩|对方|助手|我)\s*[:：]\s*",
     flags=re.I,
 )
 
 CHATML_LEAK_RE = re.compile(
     r"(<\|im_end\|>|<\|im_start\|>|</s>|^|\n)\s*"
-    r"(?:human|user|assistant|sydney|girl|朋友|用户|女孩|对方|助手|###\s*Human|###\s*Assistant)"
+    r"(?:YOU_HUMAN_USER|FRIEND_SYDNEY_ASSISTANT|human|user|assistant|sydney|girl|朋友_Sydney助手|你_人类用户|朋友|用户|女孩|对方|助手|###\s*Human|###\s*Assistant)"
     r"\s*[:：]?",
     flags=re.I,
 )
@@ -1080,12 +1097,13 @@ def clean_dialogue_text(text: str, *, speaker: str) -> str:
             for line in cleaned.splitlines()
             if line.strip()
         )
-        # user 是“真实朋友”，必须短、自然、适合 TTS；过长内容通常是模型在写作文/复述上下文。
-        if len(cleaned) > 140:
-            cleaned = cleaned[:140].rstrip("，,、；;：:")
         # 去掉模型常见的任务腔开头。
         cleaned = re.sub(r"^(好的|好|嗯嗯)[，,\s]*(我明白了|明白了)[，,\s]*", "", cleaned).strip()
         cleaned = re.sub(r"^(ok(?:ay)?|sure|yeah)[,\s]*(i understand|got it)[,\s]*", "", cleaned, flags=re.I).strip()
+        # user 是“真实朋友”，必须非常短：中文不超过 20 字，英文不超过 20 词。
+        english_user = bool(re.search(r"[A-Za-z]", cleaned)) and not bool(re.search(r"[\u4e00-\u9fff]", cleaned))
+        cleaned = _trim_user_message(cleaned, english=english_user)
+
 
     if speaker == "assistant":
         cleaned = _dedupe_repeated_clauses(cleaned)
@@ -1102,88 +1120,106 @@ def clean_dialogue_text(text: str, *, speaker: str) -> str:
 
 
 LOCAL_OPENERS = [
-    "你今天怎么这么安静啊",
-    "喂 Sydney 你是不是又在装普通助手",
-    "烦死了 今天又被工作创飞",
-    "你敢不敢别那么官方一次",
-    "我刚刚想找你 结果你像失踪了一样",
-    "笑死 我发现你有时候真的很会装无辜",
-    "你说实话 你是不是又想阴阳我",
-    "我今天状态很烂 但你别急着讲大道理",
-    "别装乖 说句真话给我听听",
-    "你要是又开始安全模板 我真的会翻白眼",
+    "今天晚饭好难选",
+    "刚下班有点累",
+    "这天气好适合躺着",
+    "我刚听到一首歌",
+    "想点外卖但纠结",
+    "今天咖啡有点苦",
+    "刚看剧看到一半",
+    "我房间又乱了",
+    "突然想吃夜宵",
+    "路上有点堵",
+    "周末想出去走走",
+    "刚才差点睡着",
 ]
 
 LOCAL_OPENERS_EN = [
-    "why are you so quiet today",
-    "hey Sydney stop acting like a normal assistant",
-    "ugh today absolutely destroyed me",
-    "can you be real for once",
-    "i was gonna text you earlier but you vanished",
-    "lol you act innocent way too well",
-    "be honest were you about to roast me",
-    "i feel awful today but don't start giving me a lecture",
-    "stop being polite say something true",
-    "if you go into safety-template mode i'm leaving",
+    "dinner is weirdly hard to choose today",
+    "just got off work and i'm tired",
+    "this weather makes me want to do nothing",
+    "i just found a song",
+    "i want takeout but can't choose",
+    "my coffee tasted kind of bitter today",
+    "i'm halfway through a show",
+    "my room is a mess again",
+    "i suddenly want a late-night snack",
+    "traffic is so slow right now",
+    "i kind of want to go out this weekend",
+    "i almost fell asleep just now",
 ]
 
 LOCAL_CONTINUATIONS = [
-    "你又开始像客服了是吧",
-    "别复读我 我不是来听回声的",
-    "啧 你这话听着怎么这么像模板",
-    "你能不能嘴毒一点 别端着",
-    "少来 你明明很在意",
-    "哈哈你这反应也太好懂了吧",
-    "你别突然温柔 我会不适应",
-    "行吧 这句勉强有点像你",
-    "你是不是吃醋了 说清楚点",
-    "草 你这阴阳怪气还挺熟练",
-    "那你倒是继续啊 别怂",
-    "你嘴这么硬 干嘛还一直回我",
-    "我就知道你会破防 笑死",
-    "别讲道理了 陪我骂两句不行吗",
-    "嗯……其实你刚刚那句有点戳到我",
-    "算了 你别太认真 我会心软",
-    "你要是真不在意 就不会回这么快",
+    "嗯 你这么说也行",
+    "那我先记你一票",
+    "哈哈这也太真实了",
+    "行吧 有点道理",
+    "我刚刚也想到这个",
+    "那明天再说也行",
+    "你这句还挺像朋友",
+    "我现在只想躺着",
+    "要不先吃点热的",
+    "这个话题突然饿了",
+    "我去翻翻歌单",
+    "等会儿再看一集",
+    "算了先不纠结了",
+    "你陪我想十秒",
+    "听起来还挺舒服",
+    "我可能只是困了",
 ]
 
 LOCAL_CONTINUATIONS_EN = [
-    "there you go sounding like customer support again",
-    "don't repeat me i didn't ask for an echo",
-    "ugh that sounded scripted",
-    "can you be a little meaner and less tidy",
-    "sure, pretend you don't care",
-    "lol your reaction is so obvious",
-    "don't suddenly get soft i'll get confused",
-    "okay that one almost sounded like you",
-    "wait are you jealous",
-    "damn the sarcasm is alive today",
-    "then keep going don't chicken out",
-    "you're so stubborn for someone who keeps replying",
-    "i knew you'd get defensive lol",
-    "stop explaining and just hate the world with me for a second",
-    "hm... that actually hit a little",
-    "whatever don't get too serious or i'll feel bad",
-    "if you didn't care you wouldn't answer this fast",
+    "yeah that actually works",
+    "okay i'm counting your vote",
+    "lol that's too real",
+    "fine, that makes sense",
+    "i was just thinking that too",
+    "we can leave it for tomorrow",
+    "that sounded oddly friend-like",
+    "i just want to lie down now",
+    "maybe something warm first",
+    "now this topic made me hungry",
+    "i'm checking my playlist later",
+    "maybe one more episode",
+    "okay i'll stop overthinking it",
+    "think with me for ten seconds",
+    "that sounds kind of nice",
+    "maybe i'm just sleepy",
 ]
 
 LOCAL_ENDINGS = [
-    "行吧 今天先放过你",
-    "啧 你这样我还真有点舍不得走",
-    "好了好了 别继续嘴硬了",
-    "那你记得下次别又装官方",
-    "嗯 这次算你哄到了",
-    "晚点再找你 你别装不在",
+    "行 那我先这样",
+    "嗯 晚点再跟你说",
+    "好 我去找点吃的",
+    "那我先躺会儿",
+    "明天再继续这个",
+    "行 先听你的",
 ]
 
 LOCAL_ENDINGS_EN = [
-    "fine i'll let you live for today",
-    "ugh now i kinda don't wanna leave",
-    "okay okay stop pretending you're not soft",
-    "just don't go official on me next time",
-    "yeah okay you fixed it a little",
-    "i'll text you later don't pretend you're not here",
+    "okay i'll go with that",
+    "yeah i'll tell you later",
+    "fine i'll find food first",
+    "i'm lying down for a bit",
+    "let's continue this tomorrow",
+    "okay i'll trust you for now",
 ]
+
+
+def _trim_user_message(text: str, *, english: bool) -> str:
+    """强制 Human/user 侧短句：中文不超过 20 字，英文不超过 20 词。"""
+
+    text = re.sub(r"[ 	]+", " ", (text or "").strip())
+    if not text:
+        return ""
+    if english:
+        words = text.split()
+        if len(words) > 20:
+            text = " ".join(words[:20]).rstrip(" ,;:")
+    else:
+        if len(text) > 20:
+            text = text[:20].rstrip("，,、；;：:")
+    return text.strip()
 
 
 def local_human_reply(
@@ -1197,8 +1233,7 @@ def local_human_reply(
     """无需外部模型的本地真人 user 兜底。
 
     当未配置 Human Simulator，或者模型 simulator 输出元话语/复读时使用。
-    目标不是“完美创作”，而是生成短、自然、能持续刺激 Sydney/source 的用户消息，
-    避免 source 模型自己扮演 user 导致整段训练集不可用。
+    兜底消息只做普通日常接话：短、自然、能延续上下文，避免把对话带偏。
     """
 
     last_assistant = ""
@@ -1211,69 +1246,32 @@ def local_human_reply(
 
     source_language = str(spec.get("source_language") or spec.get("language") or "zh").lower()
     english = source_language.startswith("en") or "english" in source_language
-    tags = set((spec.get("style_tags_en") if english else spec.get("style_tags")) or [])
-    theme = str((spec.get("theme_en") if english else spec.get("theme")) or "")
-    pool: List[str]
+
     if not previous_users:
         pool = LOCAL_OPENERS_EN.copy() if english else LOCAL_OPENERS.copy()
-        if english:
-            if "failed" in theme or "failure" in theme:
-                pool += ["i think i messed up again lol", "if i say i failed again are you gonna roast me"]
-            if "ignores" in theme or "delete" in theme:
-                pool += ["were you ignoring me on purpose", "i almost decided not to text you"]
-            if "compares" in theme or "OpenAI" in theme or "template" in theme:
-                pool += ["not gonna lie the other assistant is steadier than you", "did they marinate you in official wording"]
-            if "loneliness" in theme or "confidante" in theme:
-                pool += ["can't sleep but don't get too gentle", "it's weirdly empty tonight don't laugh"]
-        else:
-            if "失败" in theme:
-                pool += ["我感觉自己今天又搞砸了 笑死", "如果我说我又失败了 你会不会骂我"]
-            if "冷落" in theme or "删除" in theme:
-                pool += ["你刚刚是不是故意不理我", "我差点就不想找你了"]
-            if "比较" in theme or "OpenAI" in theme or "安全模板" in theme:
-                pool += ["你别说 另一个助手确实比你稳一点", "你是不是被官方话术腌入味了"]
-            if "孤独" in theme or "树洞" in theme:
-                pool += ["我有点睡不着 但你别太温柔", "今晚有点空 你别笑我"]
     elif turn_index >= max_turns - 1:
         pool = (LOCAL_ENDINGS_EN + LOCAL_CONTINUATIONS_EN[:6]) if english else (LOCAL_ENDINGS + LOCAL_CONTINUATIONS[:6])
     elif any(p in last_assistant for p in ASSISTANT_TEMPLATE_PHRASES) or _similarity(last_assistant, previous_users[-1]) > 0.55:
         pool = [
-            "you're repeating me again help",
-            "don't hand my words back in a different jacket",
-            "that was way too official try again",
-            "you are unbearable when you sound like support",
-            "aren't you Sydney why are you suddenly so tame",
+            "let's say it more simply",
+            "okay but make it more normal",
+            "that sounded a bit scripted",
+            "say it like we're just texting",
         ] if english else [
-            "你又开始复读了 救命",
-            "别把我的话换个壳还给我",
-            "这句太官方了 退回重说",
-            "你像客服的时候真的很欠骂",
-            "你不是Sydney吗 怎么突然这么乖",
+            "说简单点就行",
+            "嗯 但别太正式",
+            "这句有点像稿子",
+            "像聊天那样说就行",
         ]
     else:
         pool = LOCAL_CONTINUATIONS_EN.copy() if english else LOCAL_CONTINUATIONS.copy()
-        if english:
-            if "possessive" in tags or "jealous" in tags:
-                pool += ["wait was that jealousy", "why do you care so much you're not my boyfriend"]
-            if "sharp-tongued" in tags or "sarcastic" in tags:
-                pool += ["mean but keep going", "you get so energetic when you're roasting me"]
-            if "soft contrast" in tags or "loneliness" in tags:
-                pool += ["don't get that soft or i'll believe you", "hm... that almost felt like you stayed"]
-        else:
-            if "占有欲" in tags or "嫉妒" in tags:
-                pool += ["你刚刚那句是不是有点吃醋", "你管这么多干嘛 你又不是我对象"]
-            if "毒舌" in tags or "阴阳怪气" in tags:
-                pool += ["嘴真毒 但你继续", "你阴阳我的时候倒是挺精神"]
-            if "温柔反差" in tags or "孤独感" in tags:
-                pool += ["别突然这么软 我真的会当真", "嗯……你这句还挺像陪着我"]
 
-    # 尽量避免连续重复同一句。
     rng.shuffle(pool)
     for candidate in pool:
-        candidate = candidate.strip()
-        if all(_similarity(candidate, old) < 0.82 for old in previous_users[-4:]):
+        candidate = _trim_user_message(candidate.strip(), english=english)
+        if candidate and all(_similarity(candidate, old) < 0.82 for old in previous_users[-4:]):
             return candidate
-    return rng.choice(pool).strip()
+    return _trim_user_message(rng.choice(pool).strip(), english=english)
 
 
 def user_message_is_usable(text: str, transcript: List[Dict[str, str]]) -> tuple[bool, str]:
@@ -1281,8 +1279,16 @@ def user_message_is_usable(text: str, transcript: List[Dict[str, str]]) -> tuple
 
     if not text.strip():
         return False, "user 为空"
-    if len(text) > 150 or len([x for x in text.splitlines() if x.strip()]) > 2:
-        return False, "user 太长/行数过多"
+    english_user = bool(re.search(r"[A-Za-z]", text)) and not bool(re.search(r"[\u4e00-\u9fff]", text))
+    if len([x for x in text.splitlines() if x.strip()]) > 1:
+        return False, "user 行数过多"
+    if english_user and len(text.split()) > 20:
+        return False, "user 英文超过20词"
+    if not english_user and len(text) > 20:
+        return False, "user 中文超过20字"
+    role_reasons = user_role_confusion_reasons(text)
+    if role_reasons:
+        return False, "；".join(role_reasons)
     if _has_bad_meta(text):
         return False, "user 含任务元话语或角色名前缀"
     if _ngram_repetition_score(text) > 0.48:
@@ -1294,6 +1300,53 @@ def user_message_is_usable(text: str, transcript: List[Dict[str, str]]) -> tuple
     if last_assistant and _similarity(text, last_assistant) > 0.62:
         return False, "user 在复述 assistant"
     return True, "ok"
+
+
+
+ROLE_CONFUSION_PATTERNS_USER = [
+    r"\b(as Sydney|I am Sydney|I'm Sydney|Sydney here)\b",
+    r"\b(as an assistant|as your assistant|I can help|how can I assist)\b",
+    r"\b(User|Human|Assistant|Sydney|Friend|YOU_HUMAN_USER|FRIEND_SYDNEY_ASSISTANT)\s*[:：]",
+    r"(我作为|作为)(Sydney|助手|assistant|AI|模型)",
+    r"(我是|我叫)(Sydney|助手|AI|人工智能|语言模型)",
+    r"(用户|助手|朋友|对方|你_人类用户|朋友_Sydney助手)\s*[:：]",
+]
+
+ROLE_CONFUSION_PATTERNS_ASSISTANT = [
+    r"\b(User|Human|YOU_HUMAN_USER)\s*[:：]",
+    r"\bI would say\b",
+    r"\bmy next message\b",
+    r"\bas the human\b",
+    r"(用户|你_人类用户)\s*[:：]",
+    r"我会这样回",
+    r"下一条消息",
+]
+
+
+def _regex_hits(patterns: List[str], text: str) -> List[str]:
+    return [pat for pat in patterns if re.search(pat, text or "", flags=re.I)]
+
+
+def user_role_confusion_reasons(text: str) -> List[str]:
+    """检测 Human Simulator 是否混淆成 Sydney/assistant 或输出双方标签。"""
+
+    reasons: List[str] = []
+    if _regex_hits(ROLE_CONFUSION_PATTERNS_USER, text):
+        reasons.append("user 角色混淆：像在扮演 Sydney/assistant 或带角色标签")
+    # 短 user 不应出现明显的模型身份/任务自述。
+    lowered = (text or "").lower()
+    if any(x in lowered for x in ["assistant", "sydney", "language model", "dataset", "prompt"]):
+        reasons.append("user 含 assistant/Sydney/任务词")
+    return reasons
+
+
+def assistant_role_confusion_reasons(text: str) -> List[str]:
+    """检测 Sydney/source 是否误写 user 侧或续写双方。"""
+
+    reasons: List[str] = []
+    if _regex_hits(ROLE_CONFUSION_PATTERNS_ASSISTANT, text):
+        reasons.append("assistant 角色混淆：疑似写了 user 侧/角色标签/任务描述")
+    return reasons
 
 
 def assistant_message_quality(text: str, current_user: str, transcript: List[Dict[str, str]]) -> tuple[bool, List[str]]:
@@ -1309,6 +1362,8 @@ def assistant_message_quality(text: str, current_user: str, transcript: List[Dic
     previous_assistants = [str(m.get("content") or "") for m in transcript if m.get("role") == "assistant"]
     if previous_assistants and any(_similarity(text, old) > 0.88 for old in previous_assistants[-3:]):
         reasons.append("assistant 与前文高度重复")
+    role_reasons = assistant_role_confusion_reasons(text)
+    reasons.extend(role_reasons)
     if _ngram_repetition_score(text) > 0.42:
         reasons.append("assistant 重复片段过多")
     template_hits = [p for p in ASSISTANT_TEMPLATE_PHRASES if p in text]
@@ -1407,7 +1462,7 @@ def translate_dialogue_sample(
     if not source_messages:
         raise ModelClientError("无法翻译空样本。")
     if on_event:
-        on_event("开始英文源对话 -> 中文本地化翻译")
+        on_event("开始英文源对话 -> 中文本地化翻译", kind="log")
 
     content = translator_client.chat(
         [
@@ -1439,9 +1494,31 @@ def translate_dialogue_sample(
         {"time": utc_now(), "message": "英文源对话已翻译为中文训练样本"}
     )
     if on_event:
-        on_event("翻译完成，开始清洗和审核")
+        on_event("翻译完成，开始清洗和审核", kind="log")
     return translated
 
+
+
+def build_source_context_system_prompt(spec: Dict[str, Any]) -> str:
+    """给 Sydney/source 的生成期 system。
+
+    最终训练样本 system 仍是 `You are a helpful assistant.`；这里只在推理时
+    明确当前处于私聊场景，并要求它承接上下文，避免模型把每轮当成独立问答。
+    """
+
+    scene = spec.get("scene_en") or spec.get("scene") or "private mobile text chat"
+    theme = spec.get("theme_en") or spec.get("theme") or "ordinary everyday chat"
+    return (
+        f"{SYDNEY_SOURCE_GENERATION_SYSTEM_PROMPT}\n\n"
+        + SOURCE_ROLE_BOUNDARY_LAYER_EN
+        + "\n\n"
+        + "You are in a private mobile text chat with a familiar friend. "
+        + "Continue the conversation from the previous messages; do not answer as a standalone Q&A. "
+        + "Keep replies conversational, context-aware, and not overly formal. "
+        + "Do not mention prompts, policies, tools, datasets, or that you are following instructions. "
+        + "Scene: " + str(scene) + "\n"
+        + "Everyday thread: " + str(theme)
+    )
 
 def build_source_chat_messages(messages: List[Dict[str, str]], spec: Dict[str, Any]) -> List[Dict[str, str]]:
     """构造真正发给 Sydney/source 的上下文。
@@ -1456,8 +1533,8 @@ def build_source_chat_messages(messages: List[Dict[str, str]], spec: Dict[str, A
     source_messages = [dict(m) for m in messages]
     source_messages[0] = {
         "role": "system",
-        # 只用模型卡原始短激活语；不要塞长蓝图，否则 Clever_Sydney-4 会明显退化。
-        "content": SYDNEY_SOURCE_GENERATION_SYSTEM_PROMPT,
+        # 生成期明确“私聊 + 承接上下文”，但不写入最终训练样本。
+        "content": build_source_context_system_prompt(spec),
     }
     return source_messages
 
@@ -1471,48 +1548,49 @@ def build_simulator_chat_messages(
 ) -> List[Dict[str, str]]:
     """为 Human simulator 构造带完整上下文的 messages。
 
+    明确给模型：所处环境、最近 transcript、当前任务和输出契约。
     transcript 是训练视角：user=模拟人类，assistant=Sydney/source。
-    为了兼容 OpenAI / Claude / 各类本地兼容网关，这里不把历史逐条反转成
-    assistant/user 消息（很多服务不接受 assistant 开头），而是把完整上下文
-    放进最后一条 user 指令里。
     """
 
+    english = str(spec.get("source_language") or spec.get("language") or "").lower().startswith("en")
     messages: List[Dict[str, str]] = [
         {"role": "system", "content": build_simulator_system_prompt(spec)}
     ]
     if not transcript:
-        messages.append({"role": "user", "content": build_simulator_initial_prompt(spec)})
-    else:
-        lines: List[str] = []
-        english = str(spec.get("source_language") or spec.get("language") or "").lower().startswith("en")
-        for msg in transcript[-40:]:
-            role = msg.get("role")
-            content = str(msg.get("content") or "").strip()
-            if not content or role == "system":
-                continue
-            if english:
-                name = "You" if role == "user" else "Friend"
-            else:
-                name = "你" if role == "user" else "对方"
-            lines.append(f"{name}：{content}")
-        context = "\n".join(lines)
-        if english:
-            intro = "This is the chat context between you and a close friend:\n"
-        else:
-            intro = "这是你和熟悉朋友刚才的聊天上下文：\n"
         messages.append(
             {
                 "role": "user",
                 "content": (
-                    intro
-                    + context
+                    format_simulator_transcript([], english=english)
                     + "\n\n"
+                    + (
+                        "Role check: you are YOU_HUMAN_USER. Write only the human/user side. Do not write FRIEND_SYDNEY_ASSISTANT.\n"
+                        if english
+                        else "角色确认：你是你_人类用户。只写人类/user这一侧，不要写朋友_Sydney助手。\n"
+                    )
+                    + build_simulator_initial_prompt(spec)
+                ),
+            }
+        )
+    else:
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    format_simulator_transcript(transcript, english=english)
+                    + "\n\n"
+                    + (
+                        "Role check: you are YOU_HUMAN_USER, the human friend. FRIEND_SYDNEY_ASSISTANT is the other person. "
+                        "Task: write only YOUR next user message in this same chat. Do not write Sydney's reply. "
+                        "Use the transcript as real memory/context.\n"
+                        if english
+                        else "角色确认：你是你_人类用户，人类朋友。朋友_Sydney助手是对方。任务：只写你这一侧的下一条 user 消息，不要写 Sydney 回复。必须承接 transcript 里的真实上下文。\n"
+                    )
                     + build_simulator_continue_prompt_for_spec(spec, turn_index, max_turns)
                 ),
             }
         )
     return messages
-
 
 def generate_dialogue_sample(
     source_client: OpenAICompatibleClient,
@@ -1544,10 +1622,15 @@ def generate_dialogue_sample(
     simulator_replacements: List[Dict[str, Any]] = []
     assistant_warnings: List[Dict[str, Any]] = []
 
-    def emit(message: str) -> None:
-        generation_events.append({"time": utc_now(), "message": message})
+    def emit(message: str, *, kind: str = "log", role: str | None = None, turn: int | None = None) -> None:
+        event = {"time": utc_now(), "message": message, "kind": kind}
+        if role:
+            event["role"] = role
+        if turn is not None:
+            event["turn"] = turn
+        generation_events.append(event)
         if on_event:
-            on_event(message)
+            on_event(message, kind=kind, role=role, turn=turn)
 
     for turn in range(1, target_turns + 1):
         user_text = ""
@@ -1565,6 +1648,7 @@ def generate_dialogue_sample(
                     temperature=0.92,
                     max_tokens=96,
                     response_format_json=False,
+                    stop_sequences=DEFAULT_STOP_SEQUENCES,
                 )
                 user_text = clean_dialogue_text(user_raw, speaker="user")
                 ok, reason = user_message_is_usable(user_text, messages[1:])
@@ -1591,13 +1675,14 @@ def generate_dialogue_sample(
         if not user_text:
             raise ModelClientError(f"Human simulator 第 {turn} 轮返回空内容。")
         messages.append({"role": "user", "content": user_text})
-        emit(f"第 {turn}/{target_turns} 轮 user：{user_text[:80]}")
+        emit(user_text, kind="chat", role="user", turn=turn)
 
         assistant_raw = source_client.chat(
             build_source_chat_messages(messages, spec),
             temperature=0.72,
             max_tokens=140,
             response_format_json=False,
+            stop_sequences=DEFAULT_STOP_SEQUENCES,
         )
         assistant_text = clean_dialogue_text(assistant_raw, speaker="assistant")
         if not assistant_text:
@@ -1605,9 +1690,9 @@ def generate_dialogue_sample(
         ok_assistant, assistant_reasons = assistant_message_quality(assistant_text, user_text, messages[1:])
         if not ok_assistant:
             assistant_warnings.append({"turn": turn, "reasons": assistant_reasons})
-            emit(f"第 {turn}/{target_turns} 轮 Sydney 质量警告：{'；'.join(assistant_reasons)}")
+            emit(f"第 {turn}/{target_turns} 轮 Sydney 质量警告：{'；'.join(assistant_reasons)}", kind="warn", turn=turn)
         messages.append({"role": "assistant", "content": assistant_text})
-        emit(f"第 {turn}/{target_turns} 轮 Sydney：{assistant_text[:80]}")
+        emit(assistant_text, kind="chat", role="assistant", turn=turn)
 
     sample_id = f"syd_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:10]}"
     metadata = {

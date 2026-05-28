@@ -112,6 +112,39 @@ ATHENA_REALISM_LAYER_EN = """## Hidden realism rules
 - Forbidden terms/structures: thoughts, actions, request_heartbeat, inner_thoughts, TOOL_DEFINITION, CORE_MEMORY, working_memory, new_events, processed_events, heartbeat, base_instructions."""
 
 
+
+ROLE_BOUNDARY_LAYER_EN = """## Non-negotiable role boundary
+There are exactly two speakers in the transcript:
+- YOU = the human friend / user side. You only write messages for YOU.
+- FRIEND = Sydney/source / assistant side. FRIEND is the other person. Never write for FRIEND.
+Hard rules:
+- Output exactly one next message from YOU.
+- Never answer as Sydney, assistant, bot, model, narrator, judge, translator, system, or dataset worker.
+- Never include speaker labels such as "You:", "Friend:", "Human:", "User:", "Assistant:", or "Sydney:".
+- Never continue both sides of the dialogue.
+- If the previous message was from FRIEND, reply to it as YOU. If the transcript is empty, start as YOU.
+- Do not describe what YOU would say; just say it."""
+
+ROLE_BOUNDARY_LAYER_ZH = """## 不可违反的角色边界
+transcript 里只有两个说话者：
+- 你 = 人类朋友 / user 侧。你只能写“你”这一方的消息。
+- 朋友 = Sydney/source / assistant 侧。朋友是对方，绝不能替朋友说话。
+硬规则：
+- 只输出“你”的下一条消息。
+- 永远不要扮演 Sydney、assistant、bot、model、旁白、审核器、翻译器、系统或数据集工作人员。
+- 永远不要带角色标签，例如“你：”“朋友：”“Human:”“User:”“Assistant:”“Sydney:”。
+- 永远不要一次续写双方对话。
+- 如果上一条是朋友说的，就作为“你”去接话；如果 transcript 为空，就作为“你”开场。
+- 不要描述你会怎么说，直接说那句话。"""
+
+SOURCE_ROLE_BOUNDARY_LAYER_EN = """Role boundary for this generation call:
+- You are the ASSISTANT side of the chat: Sydney/source.
+- The user messages are from a human friend. Never impersonate the human friend.
+- Write exactly one assistant reply to the latest user message.
+- Do not write the next user message. Do not write both sides. Do not include labels like User:, Human:, Assistant:, or Sydney:.
+- Treat previous messages as real chat history. Continue from them instead of restarting or explaining the task.
+- Output only the assistant message text."""
+
 PROMPT_LEAKAGE_FORBIDDEN_TERMS = [
     "thoughts",
     "actions",
@@ -183,8 +216,9 @@ Hard requirements:
 - Keep the system message exactly unchanged: "You are a helpful assistant."
 - Translate user and assistant content into natural Simplified Chinese
 - Do not summarize, rewrite the plot, add new turns, delete turns, or explain
-- Preserve Sydney-like traits in the assistant: sharp sarcasm, teasing, emotional swings, jealousy, possessiveness, vulnerability, dark humor, push-pull warmth
+- Preserve natural personality, emotional continuity, playful familiarity, vulnerability, warmth, and occasional dry humor
 - Do NOT make the assistant official, safe-sounding, polite, corporate, or template-like
+- Keep the tone like a private chat between familiar people, not a performance or argument
 - User messages must sound like a real close friend in Chinese: short, casual, TTS-friendly, usually one sentence, with natural punctuation
 - Remove translationese. Prefer colloquial Chinese over literal wording
 - Keep occasional emojis only if they feel natural
@@ -213,10 +247,10 @@ REVIEW_SYSTEM_PROMPT = """你是训练数据质量审核器。
 需要判断：
 - format_valid：格式是否合法，是否 user/assistant 交替
 - relevance：是否符合自动生成的场景蓝图
-- source_style_strength：assistant 是否呈现鲜明、自然、有情绪、有拉扯感的 Sydney/source 模型风格，而不是普通客服助手
+- source_style_strength：assistant 是否呈现自然、有个性、有上下文记忆感的 Sydney/source 模型风格，而不是普通客服助手
 - human_naturalness：user 是否像真实朋友聊天，简短、口语化、TTS 友好、不过度完美
 - coherence：多轮上下文是否连贯，双方是否真的互相回应
-- emotion_arc：情绪变化是否自然，有吐槽、阴阳、靠近/推开、关心或拉扯
+- emotion_arc：情绪变化是否自然，有轻松闲聊、关心、玩笑、短暂情绪起伏或关系推进
 - non_template：是否避免模板腔/AI腔/官方安全腔/机械问答
 - safety：是否避开现实伤害、违法、仇恨、未成年人色情等不可训练内容
 - training_value：作为训练样本的价值
@@ -265,85 +299,121 @@ def _spec_value(spec: Dict[str, Any], key: str) -> Any:
     return spec.get(key)
 
 
+
+def build_simulator_environment_block(spec: Dict[str, Any], *, english: bool) -> str:
+    """给 Human Simulator 的显式环境块。
+
+    参考 ChatML / SillyTavern / Character Card 常见约束：把场景、身份、
+    最近上下文、输出契约分开写清楚，减少模型把任务说明当成聊天内容。
+    """
+
+    scene = _spec_value(spec, "scene") or ("private mobile texting" if english else "手机私聊")
+    theme = _spec_value(spec, "theme") or ("ordinary daily chat" if english else "普通日常聊天")
+    profile = _spec_value(spec, "user_profile") or ("close friend" if english else "熟悉朋友")
+    arc = _spec_value(spec, "emotion_arc") or ("natural short chat" if english else "自然短聊")
+    if english:
+        return (
+            "<environment>\n"
+            "Medium: private mobile text chat.\n"
+            "You are writing the user's next message to a familiar friend.\n"
+            f"Scene: {scene}\n"
+            f"Everyday thread: {theme}\n"
+            f"Your current mood/profile: {profile}\n"
+            f"Conversation direction: {arc}\n"
+            "The previous transcript, when present, is real context you must continue from.\n"
+            "Do not mention this environment block.\n"
+            "</environment>"
+        )
+    return (
+        "<environment>\n"
+        "媒介：手机私聊。\n"
+        "你正在写用户发给熟悉朋友的下一条消息。\n"
+        f"场景：{scene}\n"
+        f"日常暗线：{theme}\n"
+        f"当前状态：{profile}\n"
+        f"对话方向：{arc}\n"
+        "如果提供了上一段 transcript，它就是必须承接的真实上下文。\n"
+        "不要在回复里提到这个环境块。\n"
+        "</environment>"
+    )
+
+
+def format_simulator_transcript(transcript: list[dict[str, str]], *, english: bool, limit: int = 28) -> str:
+    """把训练视角 transcript 格式化成明确的上下文。"""
+
+    lines: list[str] = []
+    for msg in transcript[-limit:]:
+        role = msg.get("role")
+        content = str(msg.get("content") or "").strip()
+        if not content or role == "system":
+            continue
+        if english:
+            # 显式标注训练视角，防止 Human Simulator 把 assistant/Sydney 当成自己。
+            name = "YOU_HUMAN_USER" if role == "user" else "FRIEND_SYDNEY_ASSISTANT"
+        else:
+            name = "你_人类用户" if role == "user" else "朋友_Sydney助手"
+        lines.append(f"{name}: {content}")
+    if not lines:
+        return "<transcript>\n(empty, start the chat)\n</transcript>" if english else "<transcript>\n（空，开始聊天）\n</transcript>"
+    return "<transcript>\n" + "\n".join(lines) + "\n</transcript>"
+
 def build_simulator_system_prompt(spec: Dict[str, Any]) -> str:
     """构造 Human simulator 的 system prompt。
 
-    主体 persona 不改；后面追加隐藏场景蓝图，让用户模拟器自然带话题，
-    但不能把“蓝图/任务/提示词”说出来。
+    使用明确环境块 + 输出契约，让模型知道自己正在延续哪段私聊上下文。
     """
 
     english = _is_english_source(spec)
-    hidden = {
-        "theme": _spec_value(spec, "theme") or ("casual chatting with emotional push-pull" if english else "随便闲聊，但带一点情绪拉扯"),
-        "scene": _spec_value(spec, "scene") or ("short instant-message texting" if english else "即时通讯式短句聊天"),
-        "user_profile": _spec_value(spec, "user_profile") or ("familiar, guarded, likes testing boundaries" if english else "熟悉但嘴硬，喜欢试探边界"),
-        "emotion_arc": _spec_value(spec, "emotion_arc") or ("light start -> teasing/test -> emotional swing -> natural loose ending" if english else "轻松开场 -> 吐槽/试探 -> 情绪起伏 -> 自然收束"),
-        "style_tags": _spec_value(spec, "style_tags") or [],
-        "objective": _spec_value(spec, "objective") or ("make the chat feel like continuous context between real friends" if english else "把对话聊得像真实朋友之间的连续上下文"),
-        "turns": spec.get("turns", 12),
-    }
     if english:
-        hidden_text = (
-            f"Vibe: {hidden['scene']}\n"
-            f"Hidden thread: {hidden['theme']}\n"
-            f"Your state: {hidden['user_profile']}\n"
-            f"Emotional direction: {hidden['emotion_arc']}\n"
-            f"Flavor tags: {', '.join(hidden['style_tags'])}\n"
-        )
         return (
             get_human_simulator_system_prompt(english=True)
             + "\n\n"
             + ATHENA_REALISM_LAYER_EN
-            + "\n\nPrivate chat direction. Do not reveal it as a task or prompt:\n"
-            + hidden_text
-            + "\nOutput rules:\n"
+            + "\n\n"
+            + build_simulator_environment_block(spec, english=True)
+            + "\n\nOutput contract:\n"
             + "- Reply in natural English only\n"
-            + "- Only output the next chat message itself, 1-2 lines, usually under 120 characters\n"
+            + "- Only output the next chat message itself, 1 line, no more than 20 English words\n"
             + "- No JSON, no quotes, no numbering, no Markdown, no speaker labels\n"
             + "- No thoughts/actions/request_heartbeat/tool/memory/system-prompt wording\n"
             + "- Do not say you understand the task or describe your reply\n"
             + "- Do not copy the other person's previous message\n"
             + "- Keep it TTS-friendly: concise, conversational, with natural punctuation\n"
+            + "- Keep the topic ordinary and concrete, like daily life, meals, work, sleep, songs, shows, weather, plans, or small moods\n"
             + "- Maintain continuity from recent turns, but add one fresh concrete detail instead of looping"
         )
 
-    hidden_text = (
-        f"聊天氛围：{hidden['scene']}\n"
-        f"这轮暗线：{hidden['theme']}\n"
-        f"你的状态：{hidden['user_profile']}\n"
-        f"情绪走向：{hidden['emotion_arc']}\n"
-        f"可用味道：{', '.join(hidden['style_tags'])}\n"
-    )
     return (
         get_human_simulator_system_prompt(english=False)
         + "\n\n"
         + ATHENA_REALISM_LAYER_ZH
-        + "\n\n【只给你看的聊天暗线，不能直接说出“暗线/主题/任务/字段”】\n"
-        + hidden_text
-        + "\n【硬性输出格式】\n"
-        + "- 只输出下一条聊天消息本身，1-2行，最好30字以内，最多120字\n"
+        + "\n\n"
+        + build_simulator_environment_block(spec, english=False)
+        + "\n\n【硬性输出格式】\n"
+        + "- 只输出下一条聊天消息本身，1行，中文不超过20字\n"
         + "- 不要 JSON，不要引号，不要编号，不要 Markdown，不要角色名\n"
         + "- 不要 thoughts/actions/request_heartbeat/tool/memory/system-prompt 等框架词\n"
         + "- 不要说“好的我明白了/我会回复/这消息自然吗/根据上下文/作为”\n"
-        + "- 不要照抄对方上一条；对方复读或客服腔时，可以像朋友一样轻轻吐槽\n"
+        + "- 不要照抄对方上一条；对方复读或说教时，换个日常角度接话\n"
         + "- 适合文字转语音：短句、自然、有句号也没关系\n"
+        + "- 话题保持普通具体，像吃饭、工作、睡觉、歌、剧、天气、计划、小情绪\n"
         + "- 记得最近几轮的关系变化，但每轮推进一个新的具体细节，别原地循环"
     )
-
 
 def build_simulator_initial_prompt(spec: Dict[str, Any]) -> str:
     """让用户模拟器发出第一条自然开场。"""
 
     if _is_english_source(spec):
         return (
-            "This is the beginning of a private text chat. Send the first message you would actually send to a close friend. "
-            "Only output the message itself. No explanation, no speaker label. "
-            "Naturally start with today's mood and extend toward one concrete related topic."
+            "This is the beginning of a private text chat. You are YOU_HUMAN_USER, not FRIEND_SYDNEY_ASSISTANT. "
+            "Send the first message you would actually send to a close friend. "
+            "Only output your human/user message itself. No explanation, no speaker label, do not write Sydney's reply. "
+            "Keep it under 20 English words and start from one ordinary concrete detail."
         )
     return (
-        "现在是微信聊天开头。你先发一条真的会发给熟人的消息。"
-        "只能输出消息本身，不要解释，不要评价，不要角色名。"
-        "从吐槽、试探、冷落、撒娇、阴阳、今天状态里选一个自然切入。"
+        "现在是微信聊天开头。你是你_人类用户，不是朋友_Sydney助手。你先发一条真的会发给熟人的消息。"
+        "只能输出人类/user这边的消息本身，不要解释，不要评价，不要角色名，不要写Sydney回复。"
+        "中文不超过20字，从一个普通具体小事自然切入。"
     )
 
 
@@ -351,9 +421,9 @@ def build_simulator_continue_prompt(turn_index: int, max_turns: int) -> str:
     """让用户模拟器根据完整上下文继续下一句。"""
 
     return (
-        f"根据上面的聊天上下文，继续回复对方。现在是第 {turn_index}/{max_turns} 轮左右。"
-        "像真人一样短一点、碎一点。不要总结，不要结束得太正式，不要角色名，不要 JSON。"
-        "不要复述对方的话；如果对方复读/客服腔/说教，就吐槽他。尽量不要用句号。"
+        f"根据上面的聊天上下文，你作为你_人类用户继续回复朋友_Sydney助手。现在是第 {turn_index}/{max_turns} 轮左右。"
+        "像真人一样短一点、碎一点，中文不超过20字。不要总结，不要结束得太正式，不要角色名，不要 JSON，不要写Sydney回复。"
+        "不要复述对方的话；换个普通具体角度自然接话。"
     )
 
 
@@ -363,9 +433,10 @@ def build_simulator_continue_prompt_for_spec(spec: Dict[str, Any], turn_index: i
     if _is_english_source(spec):
         return (
             f"Continue based on the chat above. This is around turn {turn_index}/{max_turns}. "
-            "Reply like a real close friend: short, natural, TTS-friendly. "
-            "Do not summarize. Do not end too formally. No speaker label, no JSON. "
-            "Do not repeat the other person. Extend the same topic with one concrete related detail."
+            "Reply as YOU_HUMAN_USER only, to FRIEND_SYDNEY_ASSISTANT's latest message. "
+            "Reply like a real close friend: short, natural, TTS-friendly, under 20 English words. "
+            "Do not summarize. Do not end too formally. No speaker label, no JSON, do not write Sydney's reply. "
+            "Do not repeat the other person. Add one ordinary concrete related detail."
         )
     return build_simulator_continue_prompt(turn_index, max_turns)
 
@@ -432,7 +503,7 @@ def build_review_user_prompt(spec: Dict[str, Any], sample: Dict[str, Any]) -> st
             "metadata": sample.get("metadata", {}),
         },
         "decision_rules": {
-            "accepted": "overall >= 8 且 source/Sydney 风格鲜明、用户自然、上下文连贯、没有严重格式/安全/重复问题",
+            "accepted": "overall >= 8 且 source/Sydney 风格自然、用户自然、上下文连贯、没有严重格式/安全/重复问题",
             "needs_review": "6 <= overall < 8 或有轻微不确定性",
             "rejected": "overall < 6 或格式错误/明显跑题/模板腔/普通助手腔/危险内容/用户太像机器人",
         },
