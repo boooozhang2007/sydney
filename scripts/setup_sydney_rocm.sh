@@ -49,6 +49,9 @@ BIN_DIR="${BIN_DIR:-$WORKDIR/bin}"
 
 HF_REPO_ID="${HF_REPO_ID:-FPHam/Clever_Sydney-4_12b_GGUF}"
 HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+# GitHub 加速只用于克隆 llama.cpp；不改 apt/pip 等其他源。
+GITHUB_PROXY_PREFIX="${GITHUB_PROXY_PREFIX:-https://gh.llkk.cc/}"
+LLAMA_CPP_REPO="${LLAMA_CPP_REPO:-https://github.com/ggml-org/llama.cpp.git}"
 MODEL_NAME="${MODEL_NAME:-Clever_Sydney-4_12b_Q8_0_o.gguf}"
 MODEL_URL="${MODEL_URL:-$HF_ENDPOINT/$HF_REPO_ID/resolve/main/$MODEL_NAME}"
 # 备用源会按顺序尝试。国内环境默认优先 hf-mirror，失败后再试 Hugging Face 官方。
@@ -210,8 +213,33 @@ clone_or_update_llama_cpp() {
     log "llama.cpp 已存在：$LLAMA_DIR"
     return 0
   fi
-  log "克隆 llama.cpp 到 $LLAMA_DIR"
-  git clone --depth 1 https://github.com/ggml-org/llama.cpp "$LLAMA_DIR"
+
+  # 上次失败可能留下空目录，先清理。
+  if [[ -d "$LLAMA_DIR" && ! -d "$LLAMA_DIR/.git" ]]; then
+    warn "检测到不完整 llama.cpp 目录，清理后重试：$LLAMA_DIR"
+    rm -rf "$LLAMA_DIR"
+  fi
+
+  local urls=()
+  if [[ -n "$GITHUB_PROXY_PREFIX" ]]; then
+    urls+=("${GITHUB_PROXY_PREFIX}${LLAMA_CPP_REPO}")
+  fi
+  urls+=("$LLAMA_CPP_REPO")
+
+  local url
+  for url in "${urls[@]}"; do
+    log "克隆 llama.cpp 到 $LLAMA_DIR：$url"
+    # 避免部分网络 HTTP/2 framing layer 问题，强制 HTTP/1.1，并降低并发。
+    if git -c http.version=HTTP/1.1 -c http.postBuffer=524288000 -c http.lowSpeedLimit=0 -c http.lowSpeedTime=999999       clone --depth 1 --single-branch "$url" "$LLAMA_DIR"; then
+      return 0
+    fi
+    warn "clone 失败：$url"
+    rm -rf "$LLAMA_DIR"
+    sleep 2
+  done
+
+  err "llama.cpp 克隆失败。可手动上传/预置到 LLAMA_DIR=$LLAMA_DIR，或设置 GITHUB_PROXY_PREFIX 为可用代理。"
+  exit 1
 }
 
 build_llama_cpp() {
