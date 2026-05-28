@@ -1,16 +1,11 @@
 #!/usr/bin/env bash
-# 管理云端两个 GGUF 模型：
+# 管理云端两个模型：
 #   1) Sydney source: llama.cpp GGUF OpenAI-compatible API
-#   2) Qwen3.6-27B: llama.cpp GGUF OpenAI-compatible API
+#   2) Qwen3.6-27B-FP8: vLLM OpenAI-compatible API
 #
 # 默认端口：
 #   Sydney: http://127.0.0.1:8000/v1
 #   Qwen:   http://127.0.0.1:8010/v1
-#
-# 用法：
-#   bash scripts/manage_cloud_models.sh start-all
-#   bash scripts/manage_cloud_models.sh restart-qwen
-#   bash scripts/manage_cloud_models.sh logs-qwen
 
 set -Eeuo pipefail
 
@@ -27,6 +22,7 @@ fi
 LOG_DIR="${LOG_DIR:-$STACK_DIR/logs}"
 RUN_DIR="${RUN_DIR:-$STACK_DIR/run}"
 APP_DIR="${APP_DIR:-$REPO_DIR}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 GITHUB_PROXY_PREFIX="${GITHUB_PROXY_PREFIX:-https://gh.llkk.cc/}"
 
@@ -38,43 +34,38 @@ SYDNEY_HOST="${SYDNEY_HOST:-127.0.0.1}"
 SYDNEY_PORT="${SYDNEY_PORT:-8000}"
 SYDNEY_MODEL_NAME="${SYDNEY_MODEL_NAME:-clever-sydney-4-12b-q8}"
 SYDNEY_MODEL_LOCAL_FILE="${SYDNEY_MODEL_LOCAL_FILE:-}"
-SYDNEY_PARALLEL="${SYDNEY_PARALLEL:-80}"
-SYDNEY_CTX_SIZE="${SYDNEY_CTX_SIZE:-400000}"
+SYDNEY_PARALLEL="${SYDNEY_PARALLEL:-64}"
+SYDNEY_CTX_SIZE="${SYDNEY_CTX_SIZE:-262144}"
 SYDNEY_GPU_LAYERS="${SYDNEY_GPU_LAYERS:-999}"
 SYDNEY_BATCH_SIZE="${SYDNEY_BATCH_SIZE:-512}"
 SYDNEY_UBATCH_SIZE="${SYDNEY_UBATCH_SIZE:-512}"
 SYDNEY_FORCE_SETUP="${SYDNEY_FORCE_SETUP:-0}"
 SYDNEY_EXTRA_ENV="${SYDNEY_EXTRA_ENV:-}"
 
-QWEN_WORKDIR="${QWEN_WORKDIR:-/workspace/qwen36_27b_rocm}"
-QWEN_LLAMA_DIR="${QWEN_LLAMA_DIR:-$SHARED_LLAMA_DIR}"
 QWEN_HOST="${QWEN_HOST:-127.0.0.1}"
 QWEN_PORT="${QWEN_PORT:-8010}"
-QWEN_SERVED_MODEL_NAME="${QWEN_SERVED_MODEL_NAME:-qwen3.6-27b-q8-gguf}"
-QWEN_GGUF_REPO_ID="${QWEN_GGUF_REPO_ID:-ggml-org/Qwen3.6-27B-GGUF}"
-QWEN_GGUF_MODEL_NAME="${QWEN_GGUF_MODEL_NAME:-Qwen3.6-27B-Q8_0.gguf}"
-QWEN_MODEL_PROVIDER="${QWEN_MODEL_PROVIDER:-${MODEL_PROVIDER:-auto}}" # auto / hf / modelscope
-QWEN_MS_GGUF_MODEL_ID="${QWEN_MS_GGUF_MODEL_ID:-}"
-QWEN_MS_GGUF_FILE_PATH="${QWEN_MS_GGUF_FILE_PATH:-$QWEN_GGUF_MODEL_NAME}"
-QWEN_MODEL_LOCAL_FILE="${QWEN_MODEL_LOCAL_FILE:-}"
-QWEN_MODEL_LOCAL_SEARCH_DIRS="${QWEN_MODEL_LOCAL_SEARCH_DIRS:-/mnt /mnt/data /workspace /root}"
-QWEN_PARALLEL="${QWEN_PARALLEL:-80}"
-QWEN_CTX_SIZE="${QWEN_CTX_SIZE:-262144}"
-QWEN_GPU_LAYERS="${QWEN_GPU_LAYERS:-999}"
-QWEN_BATCH_SIZE="${QWEN_BATCH_SIZE:-512}"
-QWEN_UBATCH_SIZE="${QWEN_UBATCH_SIZE:-256}"
-QWEN_TEMP="${QWEN_TEMP:-0.55}"
-QWEN_TOP_P="${QWEN_TOP_P:-0.90}"
-QWEN_REPEAT_PENALTY="${QWEN_REPEAT_PENALTY:-1.08}"
-QWEN_LLAMA_ARG_FIT="${QWEN_LLAMA_ARG_FIT:-off}"
-QWEN_LLAMA_CONT_BATCHING="${QWEN_LLAMA_CONT_BATCHING:-1}"
-QWEN_FORCE_SETUP="${QWEN_FORCE_SETUP:-0}"
-QWEN_EXTRA_ENV="${QWEN_EXTRA_ENV:-}"
+QWEN_MS_MODEL_ID="${QWEN_MS_MODEL_ID:-Qwen/Qwen3.6-27B-FP8}"
+QWEN_MODEL_DIR="${QWEN_MODEL_DIR:-/workspace/modelscope/qwen36_27b_fp8}"
+QWEN_SERVED_MODEL_NAME="${QWEN_SERVED_MODEL_NAME:-qwen3.6-27b-fp8}"
+QWEN_GPU_MEMORY_UTILIZATION="${QWEN_GPU_MEMORY_UTILIZATION:-0.40}"
+QWEN_AUTO_MEMORY_UTIL="${QWEN_AUTO_MEMORY_UTIL:-1}"
+QWEN_MAX_MODEL_LEN="${QWEN_MAX_MODEL_LEN:-32768}"
+QWEN_MAX_NUM_SEQS="${QWEN_MAX_NUM_SEQS:-64}"
+QWEN_MAX_NUM_BATCHED_TOKENS="${QWEN_MAX_NUM_BATCHED_TOKENS:-65536}"
+QWEN_TENSOR_PARALLEL_SIZE="${QWEN_TENSOR_PARALLEL_SIZE:-1}"
+QWEN_DTYPE="${QWEN_DTYPE:-auto}"
+QWEN_TRUST_REMOTE_CODE="${QWEN_TRUST_REMOTE_CODE:-1}"
+QWEN_USE_V1="${QWEN_USE_V1:-0}"
+QWEN_ENFORCE_EAGER="${QWEN_ENFORCE_EAGER:-1}"
+QWEN_DISABLE_CUDA_GRAPH="${QWEN_DISABLE_CUDA_GRAPH:-1}"
+QWEN_CLEAR_COMPILE_CACHE="${QWEN_CLEAR_COMPILE_CACHE:-1}"
+QWEN_STARTUP_TIMEOUT_SEC="${QWEN_STARTUP_TIMEOUT_SEC:-900}"
+VLLM_EXTRA_ARGS="${VLLM_EXTRA_ARGS:-}"
 
-START_ORDER="${START_ORDER:-qwen-first}" # qwen-first | sydney-first
+START_ORDER="${START_ORDER:-sydney-first}" # sydney-first | qwen-first
 MANAGER_KILL_PORT_FALLBACK="${MANAGER_KILL_PORT_FALLBACK:-1}"
 
-mkdir -p "$LOG_DIR" "$RUN_DIR"
+mkdir -p "$LOG_DIR" "$RUN_DIR" "$QWEN_MODEL_DIR"
 
 log(){ printf '\033[1;36m[model-manager]\033[0m %s\n' "$*"; }
 warn(){ printf '\033[1;33m[warn]\033[0m %s\n' "$*" >&2; }
@@ -111,19 +102,11 @@ kill_pid_file(){
     pid="$(pid_from_file "$f")"
     pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
     log "停止 $name PID=$pid${pgid:+ PGID=$pgid}"
-    if [[ -n "$pgid" ]]; then
-      kill -TERM -- "-$pgid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
-    else
-      kill -TERM "$pid" 2>/dev/null || true
-    fi
+    if [[ -n "$pgid" ]]; then kill -TERM -- "-$pgid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true; else kill -TERM "$pid" 2>/dev/null || true; fi
     for _ in {1..20}; do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
     if kill -0 "$pid" 2>/dev/null; then
       warn "$name 未正常退出，强制结束"
-      if [[ -n "$pgid" ]]; then
-        kill -KILL -- "-$pgid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
-      else
-        kill -KILL "$pid" 2>/dev/null || true
-      fi
+      if [[ -n "$pgid" ]]; then kill -KILL -- "-$pgid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true; else kill -KILL "$pid" 2>/dev/null || true; fi
     fi
   fi
   rm -f "$f"
@@ -133,34 +116,26 @@ kill_pid_file(){
 curl_models(){ local port="$1"; curl -fsS --max-time 5 "http://127.0.0.1:$port/v1/models" 2>/dev/null || true; echo; }
 print_gpu(){ if have rocm-smi; then rocm-smi || true; elif have nvidia-smi; then nvidia-smi || true; else echo "no rocm-smi/nvidia-smi found"; fi; }
 
-qwen_model_path(){ echo "$QWEN_WORKDIR/models/$QWEN_GGUF_MODEL_NAME"; }
-qwen_runtime_ready(){ [[ -x "$QWEN_WORKDIR/bin/start_sydney_server.sh" && -f "$(qwen_model_path)" ]]; }
-sydney_runtime_ready(){ [[ -x "$SYDNEY_WORKDIR/bin/start_sydney_server.sh" ]]; }
-
 status_sydney(){
   echo "--- Sydney llama.cpp GGUF ---"
-  if [[ -x "$SYDNEY_WORKDIR/bin/status_sydney_server.sh" ]]; then
-    "$SYDNEY_WORKDIR/bin/status_sydney_server.sh" || true
-  else
-    echo "status script not found: $SYDNEY_WORKDIR/bin/status_sydney_server.sh"
-    curl_models "$SYDNEY_PORT"
-  fi
+  if [[ -x "$SYDNEY_WORKDIR/bin/status_sydney_server.sh" ]]; then "$SYDNEY_WORKDIR/bin/status_sydney_server.sh" || true; else curl_models "$SYDNEY_PORT"; fi
 }
 
 status_qwen(){
-  echo "--- Qwen3.6 llama.cpp GGUF ---"
-  if [[ -x "$QWEN_WORKDIR/bin/status_sydney_server.sh" ]]; then
-    "$QWEN_WORKDIR/bin/status_sydney_server.sh" || true
+  echo "--- Qwen vLLM ---"
+  local pf="$RUN_DIR/qwen-vllm.pid"
+  if pid_alive "$pf"; then
+    local pid; pid="$(pid_from_file "$pf")"
+    echo "qwen-vllm: running PID=$pid"
+    tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true
+    echo
   else
-    echo "status script not found: $QWEN_WORKDIR/bin/status_sydney_server.sh"
-    curl_models "$QWEN_PORT"
+    echo "qwen-vllm: stopped"
   fi
-  if [[ -f "$RUN_DIR/qwen-vllm.pid" ]]; then
-    echo "legacy qwen-vllm pid file exists: $RUN_DIR/qwen-vllm.pid"
-  fi
+  curl_models "$QWEN_PORT"
 }
 
-status_all(){ status_qwen; status_sydney; echo "--- GPU ---"; print_gpu; }
+status_all(){ status_sydney; status_qwen; echo "--- GPU ---"; print_gpu; }
 
 setup_sydney(){
   [[ -f "$SCRIPT_DIR/setup_sydney_rocm.sh" ]] || { err "找不到 $SCRIPT_DIR/setup_sydney_rocm.sh"; exit 1; }
@@ -174,10 +149,7 @@ setup_sydney(){
 }
 
 start_sydney(){
-  if [[ "$SYDNEY_FORCE_SETUP" == "1" || ! -x "$SYDNEY_WORKDIR/bin/start_sydney_server.sh" ]]; then
-    setup_sydney
-    return 0
-  fi
+  if [[ "$SYDNEY_FORCE_SETUP" == "1" || ! -x "$SYDNEY_WORKDIR/bin/start_sydney_server.sh" ]]; then setup_sydney; return 0; fi
   log "启动 Sydney: host=$SYDNEY_HOST port=$SYDNEY_PORT parallel=$SYDNEY_PARALLEL ctx=$SYDNEY_CTX_SIZE"
   # shellcheck disable=SC2086
   env HOST="$SYDNEY_HOST" PORT="$SYDNEY_PORT" PARALLEL="$SYDNEY_PARALLEL" CTX_SIZE="$SYDNEY_CTX_SIZE" \
@@ -185,68 +157,117 @@ start_sydney(){
     $SYDNEY_EXTRA_ENV "$SYDNEY_WORKDIR/bin/start_sydney_server.sh"
 }
 
-stop_sydney(){
-  if [[ -x "$SYDNEY_WORKDIR/bin/stop_sydney_server.sh" ]]; then "$SYDNEY_WORKDIR/bin/stop_sydney_server.sh" || true; fi
-  kill_port_fallback "$SYDNEY_PORT" "sydney-llama-server"
-}
+stop_sydney(){ if [[ -x "$SYDNEY_WORKDIR/bin/stop_sydney_server.sh" ]]; then "$SYDNEY_WORKDIR/bin/stop_sydney_server.sh" || true; fi; kill_port_fallback "$SYDNEY_PORT" "sydney-llama-server"; }
 restart_sydney(){ stop_sydney; start_sydney; }
 
-stop_qwen_vllm_legacy(){ kill_pid_file "$RUN_DIR/qwen-vllm.pid" "legacy-qwen-vllm" "$QWEN_PORT"; }
-
-setup_qwen(){
-  [[ -f "$SCRIPT_DIR/setup_qwen36_27b_rocm.sh" ]] || { err "找不到 $SCRIPT_DIR/setup_qwen36_27b_rocm.sh"; exit 1; }
-  stop_qwen_vllm_legacy
-  log "配置/启动 Qwen3.6 GGUF：provider=$QWEN_MODEL_PROVIDER hf_repo=$QWEN_GGUF_REPO_ID ms_model=${QWEN_MS_GGUF_MODEL_ID:-<empty>} file=$QWEN_GGUF_MODEL_NAME"
-  log "Qwen params: port=$QWEN_PORT parallel=$QWEN_PARALLEL ctx=$QWEN_CTX_SIZE batch=$QWEN_BATCH_SIZE ubatch=$QWEN_UBATCH_SIZE fit=$QWEN_LLAMA_ARG_FIT served=$QWEN_SERVED_MODEL_NAME"
-  # shellcheck disable=SC2086
-  env HF_ENDPOINT="$HF_ENDPOINT" GITHUB_PROXY_PREFIX="$GITHUB_PROXY_PREFIX" \
-    WORKDIR="$QWEN_WORKDIR" LLAMA_DIR="$QWEN_LLAMA_DIR" \
-    MODEL_PROVIDER="$QWEN_MODEL_PROVIDER" MODELSCOPE_MODEL_ID="$QWEN_MS_GGUF_MODEL_ID" MODELSCOPE_FILE_PATH="$QWEN_MS_GGUF_FILE_PATH" \
-    HF_REPO_ID="$QWEN_GGUF_REPO_ID" MODEL_NAME="$QWEN_GGUF_MODEL_NAME" MODEL_LOCAL_FILE="$QWEN_MODEL_LOCAL_FILE" \
-    MODEL_LOCAL_SEARCH_DIRS="$QWEN_MODEL_LOCAL_SEARCH_DIRS" SERVED_MODEL_NAME="$QWEN_SERVED_MODEL_NAME" \
-    HOST="$QWEN_HOST" PORT="$QWEN_PORT" PARALLEL="$QWEN_PARALLEL" CTX_SIZE="$QWEN_CTX_SIZE" \
-    GPU_LAYERS="$QWEN_GPU_LAYERS" BATCH_SIZE="$QWEN_BATCH_SIZE" UBATCH_SIZE="$QWEN_UBATCH_SIZE" \
-    LLAMA_ARG_FIT="$QWEN_LLAMA_ARG_FIT" LLAMA_CONT_BATCHING="$QWEN_LLAMA_CONT_BATCHING" \
-    TEMP="$QWEN_TEMP" TOP_P="$QWEN_TOP_P" REPEAT_PENALTY="$QWEN_REPEAT_PENALTY" \
-    USE_TUNNEL=0 $QWEN_EXTRA_ENV bash "$SCRIPT_DIR/setup_qwen36_27b_rocm.sh" --restart
+modelscope_download_qwen_fp8(){
+  if [[ -f "$QWEN_MODEL_DIR/config.json" ]]; then log "Qwen FP8 已存在：$QWEN_MODEL_DIR"; return 0; fi
+  log "用 ModelScope 下载 Qwen FP8：$QWEN_MS_MODEL_ID -> $QWEN_MODEL_DIR"
+  QWEN_MS_MODEL_ID="$QWEN_MS_MODEL_ID" QWEN_MODEL_DIR="$QWEN_MODEL_DIR" "$PYTHON_BIN" - <<'PY'
+import os
+from pathlib import Path
+model_id=os.environ['QWEN_MS_MODEL_ID']; local_dir=os.environ['QWEN_MODEL_DIR']
+Path(local_dir).mkdir(parents=True, exist_ok=True)
+try:
+    from modelscope import snapshot_download
+except Exception:
+    from modelscope.hub.snapshot_download import snapshot_download
+for kwargs in (dict(model_id=model_id, local_dir=local_dir), dict(model_id=model_id, cache_dir=local_dir)):
+    try:
+        print('[modelscope] snapshot_download', kwargs, flush=True); snapshot_download(**kwargs); break
+    except TypeError:
+        continue
+PY
+  if [[ ! -f "$QWEN_MODEL_DIR/config.json" ]]; then
+    local found; found="$(find "$QWEN_MODEL_DIR" -maxdepth 5 -name config.json -type f | head -n 1 || true)"
+    [[ -n "$found" ]] || { err "Qwen FP8 下载后未找到 config.json：$QWEN_MODEL_DIR"; exit 1; }
+    QWEN_MODEL_DIR="$(dirname "$found")"; log "自动定位 Qwen 模型目录：$QWEN_MODEL_DIR"
+  fi
 }
+
+calc_qwen_gpu_util(){
+  if [[ "$QWEN_AUTO_MEMORY_UTIL" != "1" ]]; then echo "$QWEN_GPU_MEMORY_UTILIZATION"; return 0; fi
+  "$PYTHON_BIN" - <<'PY'
+import os
+fallback=float(os.environ.get('QWEN_GPU_MEMORY_UTILIZATION','0.40'))
+try:
+ import torch
+ free,total=torch.cuda.mem_get_info(); free_gib=free/1024**3; total_gib=total/1024**3
+ print(f'{max(0.10,min(fallback,(free_gib-8.0)/total_gib)):.3f}')
+except Exception:
+ print(fallback)
+PY
+}
+
+check_vllm_available(){
+  if ! "$PYTHON_BIN" - <<'PY' >/dev/null 2>&1
+import importlib.util, sys
+sys.exit(0 if importlib.util.find_spec('vllm') else 1)
+PY
+  then err "当前 Python 环境没有 vLLM：$PYTHON_BIN"; exit 1; fi
+}
+
+vllm_help_file(){ echo "$RUN_DIR/vllm-api-server.help"; }
+refresh_vllm_help(){ local hf; hf="$(vllm_help_file)"; [[ -s "$hf" && "${VLLM_REFRESH_HELP:-0}" != "1" ]] || "$PYTHON_BIN" -m vllm.entrypoints.openai.api_server --help > "$hf" 2>&1 || true; }
+vllm_supports(){ local flag="$1"; refresh_vllm_help; grep -q -- "$flag" "$(vllm_help_file)" 2>/dev/null; }
 
 start_qwen(){
-  stop_qwen_vllm_legacy
-  if [[ "$QWEN_FORCE_SETUP" == "1" || ! -x "$QWEN_WORKDIR/bin/start_sydney_server.sh" || ! -f "$(qwen_model_path)" ]]; then
-    setup_qwen
-    return 0
+  if pid_alive "$RUN_DIR/qwen-vllm.pid"; then log "Qwen vLLM 已在运行：PID=$(pid_from_file "$RUN_DIR/qwen-vllm.pid")"; return 0; fi
+  check_vllm_available
+  modelscope_download_qwen_fp8
+  [[ "$QWEN_CLEAR_COMPILE_CACHE" == "1" ]] && rm -rf /root/.cache/vllm/torch_compile_cache 2>/dev/null || true
+  local util; util="$(calc_qwen_gpu_util)"
+  export HF_ENDPOINT="$HF_ENDPOINT"
+  export VLLM_USE_MODELSCOPE="True"
+  export VLLM_USE_V1="$QWEN_USE_V1"
+  export PYTORCH_HIP_ALLOC_CONF="${PYTORCH_HIP_ALLOC_CONF:-expandable_segments:True}"
+  export RCCL_MSCCL_ENABLE="${RCCL_MSCCL_ENABLE:-0}"
+  local args=(
+    --host "$QWEN_HOST"
+    --port "$QWEN_PORT"
+    --model "$QWEN_MODEL_DIR"
+    --served-model-name "$QWEN_SERVED_MODEL_NAME"
+    --dtype "$QWEN_DTYPE"
+    --tensor-parallel-size "$QWEN_TENSOR_PARALLEL_SIZE"
+    --gpu-memory-utilization "$util"
+    --max-model-len "$QWEN_MAX_MODEL_LEN"
+    --max-num-seqs "$QWEN_MAX_NUM_SEQS"
+    --max-num-batched-tokens "$QWEN_MAX_NUM_BATCHED_TOKENS"
+  )
+  [[ "$QWEN_TRUST_REMOTE_CODE" == "1" ]] && vllm_supports "--trust-remote-code" && args+=(--trust-remote-code)
+  [[ "$QWEN_ENFORCE_EAGER" == "1" ]] && vllm_supports "--enforce-eager" && args+=(--enforce-eager)
+  if [[ "$QWEN_DISABLE_CUDA_GRAPH" == "1" ]]; then
+    if vllm_supports "--disable-cudagraph"; then args+=(--disable-cudagraph); else warn "当前 vLLM 无 --disable-cudagraph；已依赖 --enforce-eager/VLLM_USE_V1=$QWEN_USE_V1。"; fi
   fi
-  log "启动 Qwen GGUF: host=$QWEN_HOST port=$QWEN_PORT parallel=$QWEN_PARALLEL ctx=$QWEN_CTX_SIZE batch=$QWEN_BATCH_SIZE ubatch=$QWEN_UBATCH_SIZE fit=$QWEN_LLAMA_ARG_FIT"
-  # shellcheck disable=SC2086
-  env HOST="$QWEN_HOST" PORT="$QWEN_PORT" PARALLEL="$QWEN_PARALLEL" CTX_SIZE="$QWEN_CTX_SIZE" \
-    GPU_LAYERS="$QWEN_GPU_LAYERS" BATCH_SIZE="$QWEN_BATCH_SIZE" UBATCH_SIZE="$QWEN_UBATCH_SIZE" \
-    LLAMA_ARG_FIT="$QWEN_LLAMA_ARG_FIT" LLAMA_CONT_BATCHING="$QWEN_LLAMA_CONT_BATCHING" \
-    TEMP="$QWEN_TEMP" TOP_P="$QWEN_TOP_P" REPEAT_PENALTY="$QWEN_REPEAT_PENALTY" \
-    $QWEN_EXTRA_ENV "$QWEN_WORKDIR/bin/start_sydney_server.sh"
+  if [[ -n "$VLLM_EXTRA_ARGS" ]]; then # shellcheck disable=SC2206
+    extra=( $VLLM_EXTRA_ARGS ); args+=("${extra[@]}")
+  fi
+  log "启动 Qwen vLLM: port=$QWEN_PORT util=$util seqs=$QWEN_MAX_NUM_SEQS max_len=$QWEN_MAX_MODEL_LEN"
+  log "args: ${args[*]}"
+  nohup "$PYTHON_BIN" -m vllm.entrypoints.openai.api_server "${args[@]}" > "$LOG_DIR/qwen-vllm.log" 2>&1 &
+  echo $! > "$RUN_DIR/qwen-vllm.pid"
+  local loops=$(( QWEN_STARTUP_TIMEOUT_SEC / 2 )); [[ "$loops" -lt 1 ]] && loops=1
+  for ((i=1; i<=loops; i++)); do
+    if curl -fsS "http://127.0.0.1:$QWEN_PORT/v1/models" >/dev/null 2>&1; then log "Qwen vLLM ready"; return 0; fi
+    if ! pid_alive "$RUN_DIR/qwen-vllm.pid"; then rm -f "$RUN_DIR/qwen-vllm.pid"; err "Qwen vLLM failed. tail log:"; tail -n 160 "$LOG_DIR/qwen-vllm.log" || true; exit 1; fi
+    sleep 2
+  done
+  err "Qwen vLLM startup timeout. tail log:"; tail -n 160 "$LOG_DIR/qwen-vllm.log" || true; exit 1
 }
 
-stop_qwen(){
-  if [[ -x "$QWEN_WORKDIR/bin/stop_sydney_server.sh" ]]; then "$QWEN_WORKDIR/bin/stop_sydney_server.sh" || true; fi
-  stop_qwen_vllm_legacy
-  kill_port_fallback "$QWEN_PORT" "qwen-llama-server"
-}
+stop_qwen(){ kill_pid_file "$RUN_DIR/qwen-vllm.pid" "qwen-vllm" "$QWEN_PORT"; }
 restart_qwen(){ stop_qwen; start_qwen; }
 
-start_all(){
-  if [[ "$START_ORDER" == "sydney-first" ]]; then start_sydney; start_qwen; else start_qwen; start_sydney; fi
-}
+start_all(){ if [[ "$START_ORDER" == "qwen-first" ]]; then start_qwen; start_sydney; else start_sydney; start_qwen; fi; }
 stop_all(){ stop_qwen; stop_sydney; }
 restart_all(){ stop_all; start_all; }
 
-logs_qwen(){ touch "$QWEN_WORKDIR/logs/llama-server.log"; tail -f "$QWEN_WORKDIR/logs/llama-server.log"; }
+logs_qwen(){ touch "$LOG_DIR/qwen-vllm.log"; tail -f "$LOG_DIR/qwen-vllm.log"; }
 logs_sydney(){ touch "$SYDNEY_WORKDIR/logs/llama-server.log"; tail -f "$SYDNEY_WORKDIR/logs/llama-server.log"; }
 
 smoke_chat(){
   local port="$1" model="$2" text="$3"
-  curl -fsS --max-time 120 -X POST "http://127.0.0.1:$port/v1/chat/completions" \
-    -H 'Content-Type: application/json' \
-    -d @- <<JSON
+  curl -fsS --max-time 120 -X POST "http://127.0.0.1:$port/v1/chat/completions" -H 'Content-Type: application/json' -d @- <<JSON
 {"model":"$model","messages":[{"role":"user","content":"$text"}],"max_tokens":48,"temperature":0.2}
 JSON
   echo
@@ -259,7 +280,7 @@ write_env_template(){
   mkdir -p "$(dirname "$MANAGER_ENV_FILE")"
   [[ -f "$MANAGER_ENV_FILE" ]] && cp "$MANAGER_ENV_FILE" "$MANAGER_ENV_FILE.bak.$(date +%Y%m%d_%H%M%S)" || true
   cat > "$MANAGER_ENV_FILE" <<EOF
-# model-manager persistent config: both models use llama.cpp GGUF
+# model-manager persistent config: Sydney llama.cpp + Qwen vLLM
 HF_ENDPOINT=$HF_ENDPOINT
 GITHUB_PROXY_PREFIX=$GITHUB_PROXY_PREFIX
 SHARED_LLAMA_DIR=$SHARED_LLAMA_DIR
@@ -269,24 +290,18 @@ SYDNEY_PORT=$SYDNEY_PORT
 SYDNEY_PARALLEL=$SYDNEY_PARALLEL
 SYDNEY_CTX_SIZE=$SYDNEY_CTX_SIZE
 
-QWEN_WORKDIR=$QWEN_WORKDIR
 QWEN_PORT=$QWEN_PORT
+QWEN_MS_MODEL_ID=$QWEN_MS_MODEL_ID
+QWEN_MODEL_DIR=$QWEN_MODEL_DIR
 QWEN_SERVED_MODEL_NAME=$QWEN_SERVED_MODEL_NAME
-QWEN_GGUF_REPO_ID=$QWEN_GGUF_REPO_ID
-QWEN_GGUF_MODEL_NAME=$QWEN_GGUF_MODEL_NAME
-QWEN_MODEL_PROVIDER=$QWEN_MODEL_PROVIDER
-QWEN_MS_GGUF_MODEL_ID=$QWEN_MS_GGUF_MODEL_ID
-QWEN_MS_GGUF_FILE_PATH=$QWEN_MS_GGUF_FILE_PATH
-QWEN_MODEL_LOCAL_FILE=$QWEN_MODEL_LOCAL_FILE
-QWEN_PARALLEL=$QWEN_PARALLEL
-QWEN_CTX_SIZE=$QWEN_CTX_SIZE
-QWEN_BATCH_SIZE=$QWEN_BATCH_SIZE
-QWEN_UBATCH_SIZE=$QWEN_UBATCH_SIZE
-QWEN_LLAMA_ARG_FIT=$QWEN_LLAMA_ARG_FIT
-QWEN_LLAMA_CONT_BATCHING=$QWEN_LLAMA_CONT_BATCHING
-QWEN_TEMP=$QWEN_TEMP
-QWEN_TOP_P=$QWEN_TOP_P
-QWEN_REPEAT_PENALTY=$QWEN_REPEAT_PENALTY
+QWEN_GPU_MEMORY_UTILIZATION=$QWEN_GPU_MEMORY_UTILIZATION
+QWEN_AUTO_MEMORY_UTIL=$QWEN_AUTO_MEMORY_UTIL
+QWEN_MAX_MODEL_LEN=$QWEN_MAX_MODEL_LEN
+QWEN_MAX_NUM_SEQS=$QWEN_MAX_NUM_SEQS
+QWEN_MAX_NUM_BATCHED_TOKENS=$QWEN_MAX_NUM_BATCHED_TOKENS
+QWEN_USE_V1=$QWEN_USE_V1
+QWEN_ENFORCE_EAGER=$QWEN_ENFORCE_EAGER
+QWEN_DISABLE_CUDA_GRAPH=$QWEN_DISABLE_CUDA_GRAPH
 
 START_ORDER=$START_ORDER
 EOF
@@ -295,35 +310,13 @@ EOF
 
 print_env(){
   cat <<EOF
-MANAGER_ENV_FILE=$MANAGER_ENV_FILE
-STACK_DIR=$STACK_DIR
-SCRIPT_DIR=$SCRIPT_DIR
-APP_DIR=$APP_DIR
-
-SYDNEY_WORKDIR=$SYDNEY_WORKDIR
-SYDNEY_LLAMA_DIR=$SYDNEY_LLAMA_DIR
-SYDNEY_PORT=$SYDNEY_PORT
 SYDNEY_PARALLEL=$SYDNEY_PARALLEL
 SYDNEY_CTX_SIZE=$SYDNEY_CTX_SIZE
-
-QWEN_WORKDIR=$QWEN_WORKDIR
-QWEN_LLAMA_DIR=$QWEN_LLAMA_DIR
-QWEN_PORT=$QWEN_PORT
-QWEN_SERVED_MODEL_NAME=$QWEN_SERVED_MODEL_NAME
-QWEN_GGUF_REPO_ID=$QWEN_GGUF_REPO_ID
-QWEN_GGUF_MODEL_NAME=$QWEN_GGUF_MODEL_NAME
-QWEN_MODEL_PROVIDER=$QWEN_MODEL_PROVIDER
-QWEN_MS_GGUF_MODEL_ID=$QWEN_MS_GGUF_MODEL_ID
-QWEN_MS_GGUF_FILE_PATH=$QWEN_MS_GGUF_FILE_PATH
-QWEN_MODEL_LOCAL_FILE=$QWEN_MODEL_LOCAL_FILE
-QWEN_PARALLEL=$QWEN_PARALLEL
-QWEN_CTX_SIZE=$QWEN_CTX_SIZE
-QWEN_BATCH_SIZE=$QWEN_BATCH_SIZE
-QWEN_UBATCH_SIZE=$QWEN_UBATCH_SIZE
-QWEN_LLAMA_ARG_FIT=$QWEN_LLAMA_ARG_FIT
-QWEN_LLAMA_CONT_BATCHING=$QWEN_LLAMA_CONT_BATCHING
-QWEN_MODEL_PATH=$(qwen_model_path)
-
+QWEN_MS_MODEL_ID=$QWEN_MS_MODEL_ID
+QWEN_MODEL_DIR=$QWEN_MODEL_DIR
+QWEN_MAX_NUM_SEQS=$QWEN_MAX_NUM_SEQS
+QWEN_MAX_NUM_BATCHED_TOKENS=$QWEN_MAX_NUM_BATCHED_TOKENS
+QWEN_GPU_MEMORY_UTILIZATION=$QWEN_GPU_MEMORY_UTILIZATION
 START_ORDER=$START_ORDER
 EOF
 }
@@ -333,36 +326,12 @@ usage(){
 Usage: bash scripts/manage_cloud_models.sh <command>
 
 Commands:
-  status             查看两个模型和 GPU 状态
-  start-all          启动两个 GGUF 模型，默认 Qwen -> Sydney
-  stop-all           停止两个模型
-  restart-all        重启两个模型
+  status/start-all/stop-all/restart-all
+  start-qwen stop-qwen restart-qwen logs-qwen test-qwen
+  setup-sydney start-sydney stop-sydney restart-sydney logs-sydney test-sydney
+  test-all env write-env
 
-  setup-qwen         强制配置/下载/启动 Qwen GGUF
-  start-qwen         启动 Qwen GGUF
-  stop-qwen          停止 Qwen GGUF，并清理旧 vLLM 残留
-  restart-qwen       重启 Qwen GGUF
-  logs-qwen          跟踪 Qwen llama.cpp 日志
-  test-qwen          发一条 Chat Completions 测试请求
-
-  setup-sydney       强制配置/下载/启动 Sydney GGUF
-  start-sydney       启动 Sydney GGUF
-  stop-sydney        停止 Sydney GGUF
-  restart-sydney     重启 Sydney GGUF
-  logs-sydney        跟踪 Sydney 日志
-  test-sydney        发一条 Chat Completions 测试请求
-
-  test-all           测试两个模型接口
-  env                打印当前管理参数
-  write-env          写入持久配置：/workspace/sydney_cloud_stack/model-manager.env
-
-Examples:
-  bash scripts/manage_cloud_models.sh stop-qwen
-  bash scripts/manage_cloud_models.sh setup-qwen
-  bash scripts/manage_cloud_models.sh start-all
-  QWEN_GGUF_MODEL_NAME=Qwen3.6-27B-Q6_K.gguf QWEN_FORCE_SETUP=1 bash scripts/manage_cloud_models.sh restart-qwen
-  QWEN_MODEL_LOCAL_FILE=/mnt/Qwen3.6-27B-Q8_0.gguf bash scripts/manage_cloud_models.sh setup-qwen
-  QWEN_MODEL_PROVIDER=modelscope QWEN_MS_GGUF_MODEL_ID=你的命名空间/Qwen3.6-27B-GGUF QWEN_MS_GGUF_FILE_PATH=Qwen3.6-27B-Q8_0.gguf bash scripts/manage_cloud_models.sh setup-qwen
+Defaults: APP/model concurrency 64, Sydney parallel 64, Qwen vLLM max-num-seqs 64.
 USAGE
 }
 
@@ -372,8 +341,7 @@ case "$cmd" in
   start-all) start_all ;;
   stop-all) stop_all ;;
   restart-all) restart_all ;;
-  setup-qwen) setup_qwen ;;
-  start-qwen) start_qwen ;;
+  start-qwen|setup-qwen) start_qwen ;;
   stop-qwen) stop_qwen ;;
   restart-qwen) restart_qwen ;;
   logs-qwen) logs_qwen ;;
