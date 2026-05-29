@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -69,6 +70,29 @@ DEFAULT_STOP_SEQUENCES = [
     "\n### Assistant",
 ]
 
+# 外部 OpenAI-compatible 网关（火山/智谱等）通常限制 stop 数量最多 4 个。
+# Human Simulator 只需要防止模型继续写 assistant/Sydney 这一侧，因此使用短列表。
+AUX_STOP_SEQUENCES = [
+    "\nFRIEND_SYDNEY_ASSISTANT",
+    "\nAssistant:",
+    "\nSydney:",
+    "<|im_start|>",
+]
+
+# 当非 legacy Chat Completions 调用显式传入过长 stop 列表时，优先保留这些更有用的项。
+STOP_SEQUENCE_PRIORITY = [
+    "\nFRIEND_SYDNEY_ASSISTANT",
+    "\nAssistant:",
+    "\nassistant:",
+    "\nSydney:",
+    "\nsydney:",
+    "\nUser:",
+    "\nuser:",
+    "<|im_end|>",
+    "<|im_start|>",
+    "</s>",
+]
+
 
 TRUE_VALUES = {"1", "true", "yes", "y", "on"}
 FALSE_VALUES = {"0", "false", "no", "n", "off"}
@@ -105,6 +129,50 @@ def env_float(name: str, default: float, lo: float | None = None, hi: float | No
     if hi is not None:
         value = min(hi, value)
     return value
+
+
+def _dedupe_stop_sequences(stops: List[str] | tuple[str, ...] | None) -> List[str]:
+    """清理 stop 列表，保持顺序去重。"""
+
+    result: List[str] = []
+    seen: set[str] = set()
+    for item in stops or []:
+        if not isinstance(item, str) or not item:
+            continue
+        if item in seen:
+            continue
+        seen.add(item)
+        result.append(item)
+    return result
+
+
+def _cap_stop_sequences(stops: List[str], limit: int) -> List[str]:
+    """按网关常见限制裁剪 stop 列表。
+
+    火山/智谱等 Chat Completions 兼容网关明确限制 stop 最多 4 个；
+    若列表过长，优先保留阻止模型续写下一角色的 stop。
+    """
+
+    if limit <= 0:
+        return []
+    if len(stops) <= limit:
+        return stops
+
+    picked: List[str] = []
+    used: set[str] = set()
+    for preferred in STOP_SEQUENCE_PRIORITY:
+        if preferred in stops and preferred not in used:
+            picked.append(preferred)
+            used.add(preferred)
+            if len(picked) >= limit:
+                return picked
+    for item in stops:
+        if item not in used:
+            picked.append(item)
+            used.add(item)
+            if len(picked) >= limit:
+                break
+    return picked
 
 BAD_USER_META_PHRASES = [
     "我会尽量",
@@ -218,9 +286,14 @@ class ModelConfig:
     """OpenAI endpoint 配置。
 
     api_protocol:
-      - responses: OpenAI Responses API，POST /v1/responses
-      - chat_completions: 兼容旧版 /v1/chat/completions
-      - claude_messages: Anthropic Claude Messages API，POST /v1/messages
+      - responses: OpenAI Responses API，POST {base_url}/responses
+      - chat_completions: 兼容旧版 {base_url}/chat/completions
+      - claude_messages: Anthropic Claude Messages API，POST {base_url}/messages
+
+    说明：如果 base_url 是裸域名/裸 host（例如 http://127.0.0.1:8000 或
+    https://api.openai.com），客户端会为 OpenAI-compatible 服务补一次 /v1。
+    如果 base_url 已带供应商版本路径（例如 /api/paas/v4、/api/v3、/v1），
+    则尊重用户填写的路径，不再额外插入 /v1。
     """
 
     base_url: str = ""
@@ -255,14 +328,66 @@ class ModelConfig:
 
 
 def normalize_base_url(base_url: str) -> str:
-    """兼容用户填写 root URL 或 /v1 URL。"""
+    """只做轻量清理，不再对带路径的供应商 base URL 自动补 /v1。
+
+    旧逻辑会把 https://open.bigmodel.cn/api/paas/v4 归一化成
+    https://open.bigmodel.cn/api/paas/v4/v1，导致智谱/火山等已经自带
+    版本号的网关 404。现在是否补 /v1 交给 build_api_endpoint 按路径判断。
+    """
 
     base = (base_url or "").strip().rstrip("/")
-    if not base:
+    return base
+
+
+KNOWN_API_ENDPOINT_SUFFIXES = (
+    "chat/completions",
+    "responses",
+    "messages",
+)
+
+
+def _url_path(base_url: str) -> str:
+    """取 URL path；URL 不合法时返回空串，让 httpx 在真正请求时报告错误。"""
+
+    try:
+        return urlsplit(base_url).path or ""
+    except ValueError:
         return ""
-    if base.endswith("/v1"):
+
+
+def _path_matches_endpoint(path: str, endpoint_path: str) -> bool:
+    path = (path or "").rstrip("/")
+    endpoint = "/" + endpoint_path.strip("/")
+    return path == endpoint or path.endswith(endpoint)
+
+
+def build_api_endpoint(base_url: str, endpoint_path: str) -> str:
+    """根据用户填写的 base_url 构造最终 API endpoint。
+
+    兼容三种填写方式：
+      1. 裸 host/root： http://127.0.0.1:8000
+         -> http://127.0.0.1:8000/v1/chat/completions
+      2. 已带版本路径： https://open.bigmodel.cn/api/paas/v4
+         -> https://open.bigmodel.cn/api/paas/v4/chat/completions
+      3. 已填完整 endpoint： https://.../v1/chat/completions
+         -> 原样使用
+    """
+
+    base = normalize_base_url(base_url)
+    endpoint = endpoint_path.strip("/")
+    if not base:
+        return "/" + endpoint
+
+    path = _url_path(base)
+    # 用户已经填了完整最终 endpoint，就不要再拼接。
+    if any(_path_matches_endpoint(path, suffix) for suffix in KNOWN_API_ENDPOINT_SUFFIXES):
         return base
-    return base + "/v1"
+
+    # 只有裸域名/裸 host 才默认补 /v1；任何已带路径的供应商 base 都原样追加 endpoint。
+    # 这样 /api/paas/v4 不会变成 /api/paas/v4/v1。
+    if not path or path == "/":
+        return f"{base}/v1/{endpoint}"
+    return f"{base}/{endpoint}"
 
 
 def normalize_api_protocol(api_protocol: str | None) -> str:
@@ -327,7 +452,7 @@ class OpenAICompatibleClient:
         """调用配置的协议并返回纯文本内容。
 
         为了不改动上层数据生成/审核逻辑，方法名仍叫 chat；实际默认走
-        Responses API：POST /v1/responses。
+        Responses API：POST {base_url}/responses。
         """
 
         if self.api_protocol == "responses":
@@ -399,6 +524,53 @@ class OpenAICompatibleClient:
             )
         return f"{type(exc).__name__}: {exc}"
 
+    @staticmethod
+    def _is_json_mode_unsupported_error(exc: Exception) -> bool:
+        """判断上游是否拒绝 Chat Completions JSON mode。
+
+        火山等 OpenAI-compatible 网关可能返回：
+        response_format.type=json_object is not supported by this model。
+        这种情况下端点本身可用，只需要去掉 response_format 并用提示词约束 JSON。
+        """
+
+        if not isinstance(exc, httpx.HTTPStatusError) or exc.response is None:
+            return False
+        if exc.response.status_code not in {400, 422}:
+            return False
+        text = (exc.response.text or "").lower()
+        return (
+            "response_format" in text
+            and (
+                "json_object" in text
+                or "json_schema" in text
+                or "not supported" in text
+                or "not valid" in text
+                or "unsupported" in text
+            )
+        )
+
+    @staticmethod
+    def _messages_with_json_instruction(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        """给不支持 response_format 的 Chat Completions 请求追加 JSON 输出约束。"""
+
+        instruction = (
+            "You must output only one valid JSON object. "
+            "Do not use Markdown fences, explanations, or any extra text."
+        )
+        cloned: List[Dict[str, str]] = []
+        inserted = False
+        for msg in messages:
+            item = dict(msg)
+            role = str(item.get("role") or "").strip()
+            if not inserted and role == "system":
+                content = str(item.get("content") or "").rstrip()
+                item["content"] = (content + "\n\n" if content else "") + instruction
+                inserted = True
+            cloned.append(item)
+        if not inserted:
+            cloned.insert(0, {"role": "system", "content": instruction})
+        return cloned
+
     def _post_json(self, endpoint: str, headers: Dict[str, str], body: Dict[str, Any]) -> Dict[str, Any]:
         """带轻量重试的 JSON POST。
 
@@ -444,7 +616,7 @@ class OpenAICompatibleClient:
         presence_penalty: Optional[float],
         repeat_penalty: Optional[float],
     ) -> str:
-        """调用旧版 /v1/chat/completions 并返回 message.content。"""
+        """调用 Chat Completions 并返回 message.content。"""
 
         body: Dict[str, Any] = {
             "model": self.config.model,
@@ -466,24 +638,63 @@ class OpenAICompatibleClient:
             # 所以仅在环境变量开启或 legacy/Sydney 自建端常用时发送。
             if self.api_protocol == "legacy_chat_completions" or env_bool("SEND_REPEAT_PENALTY", False):
                 body["repeat_penalty"] = repeat_penalty
-        stops = stop_sequences if stop_sequences is not None else DEFAULT_STOP_SEQUENCES
-        if stops and os.getenv("DISABLE_DEFAULT_STOP_SEQUENCES", "0") not in {"1", "true", "True"}:
-            # OpenAI Chat Completions 和 llama.cpp server 都支持 stop。
-            # 关键作用：阻止 GGUF Sydney 继续生成下一轮 ChatML token。
-            body["stop"] = stops
+        # 旧逻辑在 stop_sequences=None 时给所有 Chat Completions 请求都发送
+        # DEFAULT_STOP_SEQUENCES（23 个）。火山/智谱/OpenAI-compatible 外部网关
+        # 通常限制 stop 最多 4 个，导致 Human/Translator 测试直接 400。
+        #
+        # 新规则：
+        # - legacy_chat_completions：主要用于本地 llama.cpp/Sydney，可继续默认发送 stop；
+        # - chat_completions：外部强模型默认不发送 stop；
+        # - 调用方显式传入 stop_sequences 时发送，但普通 chat_completions 自动裁剪到 4 个。
+        stops: List[str] = []
+        if stop_sequences is not None:
+            stops = _dedupe_stop_sequences(stop_sequences)
+        elif self.api_protocol == "legacy_chat_completions":
+            stops = _dedupe_stop_sequences(DEFAULT_STOP_SEQUENCES)
+        if stops and not env_bool("DISABLE_DEFAULT_STOP_SEQUENCES", False):
+            if self.api_protocol != "legacy_chat_completions":
+                stops = _cap_stop_sequences(stops, env_int("CHAT_COMPLETIONS_STOP_LIMIT", 4, 0, 64))
+            if stops:
+                # OpenAI Chat Completions 和 llama.cpp server 都支持 stop。
+                # 关键作用：阻止 GGUF Sydney 继续生成下一轮 ChatML token。
+                body["stop"] = stops
 
-        endpoint = f"{self.base_url}/chat/completions"
+        endpoint = build_api_endpoint(self.base_url, "chat/completions")
         try:
             data = self._post_json(endpoint, self._headers(), body)
         except Exception as exc:  # noqa: BLE001
-            raise ModelClientError(
-                f"调用 Chat Completions 失败：{self._format_http_error(exc, endpoint)}"
-            ) from exc
-
+            if (
+                response_format_json
+                and "response_format" in body
+                and self._is_json_mode_unsupported_error(exc)
+                and not env_bool("DISABLE_JSON_MODE_FALLBACK", False)
+            ):
+                # 兼容火山等网关：模型支持 Chat Completions，但不支持
+                # response_format={"type":"json_object"}。移除此字段并把 JSON
+                # 约束写进 system prompt，再重试一次。
+                fallback_body = dict(body)
+                fallback_body.pop("response_format", None)
+                fallback_body["messages"] = self._messages_with_json_instruction(messages)
+                try:
+                    data = self._post_json(endpoint, self._headers(), fallback_body)
+                except Exception as fallback_exc:  # noqa: BLE001
+                    raise ModelClientError(
+                        "调用 Chat Completions 失败："
+                        f"{self._format_http_error(fallback_exc, endpoint)} "
+                        f"（已因上游不支持 response_format.json_object 自动重试无 JSON mode）"
+                    ) from fallback_exc
+            else:
+                raise ModelClientError(
+                    f"调用 Chat Completions 失败：{self._format_http_error(exc, endpoint)}"
+                ) from exc
+        else:
+            pass
         try:
             return data["choices"][0]["message"]["content"]
         except Exception as exc:  # noqa: BLE001
-            raise ModelClientError(f"模型返回格式不符合 Chat Completions：{data}") from exc
+            raise ModelClientError(
+                f"模型返回格式不符合 Chat Completions：{data}"
+            ) from exc
 
     def _claude_messages(
         self,
@@ -498,7 +709,7 @@ class OpenAICompatibleClient:
         presence_penalty: Optional[float],
         repeat_penalty: Optional[float],
     ) -> str:
-        """调用 Anthropic Claude Messages API：POST /v1/messages。"""
+        """调用 Anthropic Claude Messages API：POST {base_url}/messages。"""
 
         system, claude_messages = self._messages_to_claude(messages)
         body: Dict[str, Any] = {
@@ -519,12 +730,16 @@ class OpenAICompatibleClient:
                 (body.get("system", "") + "\n\n" if body.get("system") else "")
                 + "You must output only one valid JSON object. Do not use Markdown fences."
             )
-        stops = stop_sequences if stop_sequences is not None else DEFAULT_STOP_SEQUENCES
-        if stops and os.getenv("DISABLE_DEFAULT_STOP_SEQUENCES", "0") not in {"1", "true", "True"}:
-            # Claude Messages 的字段名是 stop_sequences。
-            body["stop_sequences"] = stops
+        # Claude/Anthropic 网关同样不默认注入本项目的 23 个 ChatML stop；
+        # 只有调用方显式传入时才发送，并默认裁剪到 4 个以兼容多数网关。
+        stops = _dedupe_stop_sequences(stop_sequences) if stop_sequences is not None else []
+        if stops and not env_bool("DISABLE_DEFAULT_STOP_SEQUENCES", False):
+            stops = _cap_stop_sequences(stops, env_int("CLAUDE_STOP_LIMIT", 4, 0, 64))
+            if stops:
+                # Claude Messages 的字段名是 stop_sequences。
+                body["stop_sequences"] = stops
 
-        endpoint = f"{self.base_url}/messages"
+        endpoint = build_api_endpoint(self.base_url, "messages")
         try:
             data = self._post_json(endpoint, self._claude_headers(), body)
         except Exception as exc:  # noqa: BLE001
@@ -599,7 +814,7 @@ class OpenAICompatibleClient:
         presence_penalty: Optional[float],
         repeat_penalty: Optional[float],
     ) -> str:
-        """调用 OpenAI Responses API：POST /v1/responses。"""
+        """调用 OpenAI Responses API：POST {base_url}/responses。"""
 
         instructions, input_text = self._messages_to_responses_input(messages)
         body: Dict[str, Any] = {
@@ -633,7 +848,7 @@ class OpenAICompatibleClient:
         # stop，可后续按需扩展。
         _ = stop_sequences
 
-        endpoint = f"{self.base_url}/responses"
+        endpoint = build_api_endpoint(self.base_url, "responses")
         try:
             data = self._post_json(endpoint, self._headers(), body)
         except Exception as exc:  # noqa: BLE001
@@ -2239,7 +2454,7 @@ def generate_dialogue_sample(
                     temperature=0.92,
                     max_tokens=96,
                     response_format_json=False,
-                    stop_sequences=DEFAULT_STOP_SEQUENCES,
+                    stop_sequences=AUX_STOP_SEQUENCES,
                 )
                 user_text = clean_dialogue_text(user_raw, speaker="user")
                 ok, reason = user_message_is_usable(user_text, messages[1:])
@@ -2404,3 +2619,4 @@ def write_jsonl(path: str, rows: List[Dict[str, Any]]) -> None:
     with open(path, "w", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
+

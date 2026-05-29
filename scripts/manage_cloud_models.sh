@@ -62,6 +62,10 @@ QWEN_DISABLE_CUDA_GRAPH="${QWEN_DISABLE_CUDA_GRAPH:-1}"
 QWEN_CLEAR_COMPILE_CACHE="${QWEN_CLEAR_COMPILE_CACHE:-1}"
 QWEN_STARTUP_TIMEOUT_SEC="${QWEN_STARTUP_TIMEOUT_SEC:-900}"
 VLLM_EXTRA_ARGS="${VLLM_EXTRA_ARGS:-}"
+VLLM_HELP_TIMEOUT_SEC="${VLLM_HELP_TIMEOUT_SEC:-45}"
+# ROCm 镜像里 `python -m vllm.entrypoints.openai.api_server --help` 可能导入很慢甚至卡住；
+# 默认不做动态探测，只传 vLLM 0.20.x ROCm 常用稳定参数。需要动态兼容时可设为 0。
+VLLM_SKIP_OPTION_PROBE="${VLLM_SKIP_OPTION_PROBE:-1}"
 # ROCm/vLLM 0.20.x 对 Qwen3.6 的 GDN/aiter/chunked prefill 组合比较敏感。
 # safe-mode 保持 max-num-seqs=64，但降低单次 batched tokens，并关闭容易触发 HIP illegal access 的启动路径。
 QWEN_ROCM_SAFE_MODE="${QWEN_ROCM_SAFE_MODE:-1}"
@@ -221,14 +225,51 @@ PY
 }
 
 vllm_help_file(){ echo "$RUN_DIR/vllm-api-server.help"; }
-refresh_vllm_help(){ local hf; hf="$(vllm_help_file)"; [[ -s "$hf" && "${VLLM_REFRESH_HELP:-0}" != "1" ]] || "$PYTHON_BIN" -m vllm.entrypoints.openai.api_server --help > "$hf" 2>&1 || true; }
+refresh_vllm_help(){
+  local hf tmp rc=0
+  hf="$(vllm_help_file)"
+  if [[ "$VLLM_SKIP_OPTION_PROBE" == "1" ]]; then
+    [[ "${_VLLM_HELP_SKIP_LOGGED:-0}" == "1" ]] || warn "已跳过 vLLM CLI 参数探测：VLLM_SKIP_OPTION_PROBE=1"
+    _VLLM_HELP_SKIP_LOGGED=1
+    : > "$hf"
+    return 0
+  fi
+  # 关键：无论成功/失败，本进程只探测一次。失败会留下空文件作为“已探测”标记，
+  # 避免 append_vllm_* 为每个可选参数重复跑一次 vLLM --help。
+  [[ "${_VLLM_HELP_PROBED:-0}" == "1" ]] && return 0
+  [[ -e "$hf" && "${VLLM_REFRESH_HELP:-0}" != "1" ]] && return 0
+  _VLLM_HELP_PROBED=1
+  tmp="$hf.tmp"
+  rm -f "$tmp"
+  log "探测 vLLM CLI 参数（最多 ${VLLM_HELP_TIMEOUT_SEC}s；首次导入 vLLM 可能较慢）"
+  if have timeout; then
+    timeout "$VLLM_HELP_TIMEOUT_SEC" "$PYTHON_BIN" -m vllm.entrypoints.openai.api_server --help > "$tmp" 2>&1 || rc=$?
+  else
+    "$PYTHON_BIN" -m vllm.entrypoints.openai.api_server --help > "$tmp" 2>&1 || rc=$?
+  fi
+  if [[ "$rc" == "0" && -s "$tmp" ]]; then
+    mv "$tmp" "$hf"
+    return 0
+  fi
+  warn "vLLM CLI 参数探测失败/超时（rc=$rc），将跳过无法确认的可选参数，避免卡在 --help。"
+  if [[ -s "$tmp" ]]; then
+    warn "vLLM --help 最近输出："
+    tail -n 40 "$tmp" >&2 || true
+  fi
+  : > "$hf"
+  rm -f "$tmp"
+  return 0
+}
 vllm_supports(){ local flag="$1"; refresh_vllm_help; grep -q -- "$flag" "$(vllm_help_file)" 2>/dev/null; }
 
 vllm_envs_file(){ echo "$RUN_DIR/vllm-envs.list"; }
 refresh_vllm_envs(){
   local ef; ef="$(vllm_envs_file)"
-  [[ -s "$ef" && "${VLLM_REFRESH_ENVS:-0}" != "1" ]] && return 0
-  "$PYTHON_BIN" - <<'PY' > "$ef" 2>/dev/null || true
+  [[ "${_VLLM_ENVS_PROBED:-0}" == "1" ]] && return 0
+  [[ -e "$ef" && "${VLLM_REFRESH_ENVS:-0}" != "1" ]] && return 0
+  _VLLM_ENVS_PROBED=1
+  if have timeout; then
+    timeout "$VLLM_HELP_TIMEOUT_SEC" "$PYTHON_BIN" - <<'PY' > "$ef" 2>/dev/null || : > "$ef"
 try:
     import vllm.envs as envs
     names = set()
@@ -242,6 +283,22 @@ try:
 except Exception:
     pass
 PY
+  else
+    "$PYTHON_BIN" - <<'PY' > "$ef" 2>/dev/null || : > "$ef"
+try:
+    import vllm.envs as envs
+    names = set()
+    for obj_name in ('environment_variables', 'ENV_VARS'):
+        obj = getattr(envs, obj_name, None)
+        if isinstance(obj, dict):
+            names.update(str(k) for k in obj.keys())
+    names.update(n for n in dir(envs) if n.isupper())
+    for n in sorted(names):
+        print(n)
+except Exception:
+    pass
+PY
+  fi
 }
 vllm_env_known(){ local name="$1"; refresh_vllm_envs; grep -qx -- "$name" "$(vllm_envs_file)" 2>/dev/null; }
 export_vllm_env_if_known(){
@@ -251,18 +308,43 @@ export_vllm_env_if_known(){
   else
     [[ "${3:-0}" == "1" ]] && warn "当前 vLLM 不识别环境变量 $name，已跳过，避免 unknown env 警告。"
   fi
+  return 0
 }
 
 append_vllm_switch(){
   local arr_name="$1" flag="$2"; local -n _arr="$arr_name"
+  if [[ "$VLLM_SKIP_OPTION_PROBE" == "1" ]]; then
+    case "$flag" in
+      --trust-remote-code|--enforce-eager)
+        _arr+=("$flag")
+        ;;
+      --language-model-only|--disable-async-output-proc|--disable-cudagraph)
+        [[ "${3:-0}" == "1" ]] && warn "已跳过可选参数 $flag：VLLM_SKIP_OPTION_PROBE=1"
+        ;;
+      *)
+        [[ "${3:-0}" == "1" ]] && warn "已跳过未知可选参数 $flag：VLLM_SKIP_OPTION_PROBE=1"
+        ;;
+    esac
+    return 0
+  fi
   if vllm_supports "$flag"; then _arr+=("$flag"); else [[ "${3:-0}" == "1" ]] && warn "当前 vLLM 不支持参数 $flag，已跳过。"; fi
+  return 0
 }
 append_vllm_option(){
   local arr_name="$1" flag="$2" value="$3"; local -n _arr="$arr_name"
+  if [[ "$VLLM_SKIP_OPTION_PROBE" == "1" ]]; then
+    [[ "${4:-0}" == "1" ]] && warn "已跳过可选参数 $flag：VLLM_SKIP_OPTION_PROBE=1"
+    return 0
+  fi
   if vllm_supports "$flag"; then _arr+=("$flag" "$value"); else [[ "${4:-0}" == "1" ]] && warn "当前 vLLM 不支持参数 $flag，已跳过。"; fi
+  return 0
 }
 append_vllm_disable_bool(){
   local arr_name="$1" flag="$2"; local -n _arr="$arr_name"
+  if [[ "$VLLM_SKIP_OPTION_PROBE" == "1" ]]; then
+    [[ "${3:-0}" == "1" ]] && warn "已跳过布尔可选参数 $flag：VLLM_SKIP_OPTION_PROBE=1"
+    return 0
+  fi
   local no_flag="--no-${flag#--}"
   local disable_flag="$flag"
   if [[ "$flag" == --enable-* ]]; then disable_flag="--disable-${flag#--enable-}"; fi
@@ -273,6 +355,7 @@ append_vllm_disable_bool(){
   else
     [[ "${3:-0}" == "1" ]] && warn "当前 vLLM 未暴露关闭 $flag 的 CLI 参数，已跳过。"
   fi
+  return 0
 }
 
 apply_qwen_rocm_safe_defaults(){
@@ -369,6 +452,8 @@ start_qwen(){
   local util; util="$(calc_qwen_gpu_util)"
   apply_qwen_rocm_safe_defaults
   apply_qwen_vllm_envs
+  log "准备启动 Qwen vLLM: port=$QWEN_PORT util=$util seqs=$QWEN_MAX_NUM_SEQS max_len=$QWEN_MAX_MODEL_LEN"
+  log "如果长时间停在这里，通常是在探测 vLLM CLI 参数；可查看：tail -f $LOG_DIR/qwen-vllm.log"
   local args=(
     --host "$QWEN_HOST"
     --port "$QWEN_PORT"

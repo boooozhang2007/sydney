@@ -1263,7 +1263,7 @@ INDEX_HTML = r"""
         <div class="panelHead"><h2>生成控制台</h2><button class="foldBtn" onclick="togglePanel('controlPanel')">⌄</button></div>
         <div class="panelBody">
           <details class="section" open><summary>Sydney/source</summary><div class="sectionInner">
-            <div class="label">Base URL</div><input id="teacherBase" class="input" placeholder="OpenAI-compatible /v1 地址" />
+            <div class="label">Base URL</div><input id="teacherBase" class="input" placeholder="OpenAI-compatible Base URL" />
             <div class="label">API Key</div><input id="teacherKey" class="input" type="password" placeholder="可留空" />
             <div class="label">Model</div><input id="teacherModel" class="input" placeholder="你的开源 Sydney 模型名" />
             <div class="label">Protocol</div><select id="teacherProtocol" class="select"><option value="responses">Responses</option><option value="chat_completions">Chat Completions</option><option value="claude_messages">Claude Messages</option></select>
@@ -1284,7 +1284,7 @@ INDEX_HTML = r"""
           </div></details>
           <details class="section"><summary>Translator</summary><div class="sectionInner">
             <label class="hint"><input id="translateToZh" type="checkbox" checked /> 英文源对话后翻译为中文</label>
-            <div class="label">Base URL</div><input id="translatorBase" class="input" placeholder="强模型 /v1 地址" />
+            <div class="label">Base URL</div><input id="translatorBase" class="input" placeholder="强模型 Base URL" />
             <div class="label">API Key</div><input id="translatorKey" class="input" type="password" />
             <div class="label">Model</div><input id="translatorModel" class="input" placeholder="推荐强中文模型" />
             <div class="label">Protocol</div><select id="translatorProtocol" class="select"><option value="responses">Responses</option><option value="chat_completions">Chat Completions</option><option value="claude_messages">Claude Messages</option></select>
@@ -1381,4 +1381,5 @@ loadConfig().then(()=>loadSamples()).then(loadStats).then(resumeJob);
 </body>
 </html>
 """
+
 

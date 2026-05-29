@@ -115,7 +115,7 @@ Options:
   --stop           停止已启动的 llama-server/cloudflared
   --restart        停止旧服务后重新启动，修改 PARALLEL/CTX_SIZE 后必须用它
   --status         查看服务状态
-  --tunnel         启动 Cloudflare Tunnel，生成公网 HTTPS URL
+  --tunnel         启动 Cloudflare Tunnel，生成公网 HTTPS URL（会自动启动服务）
   --force-rebuild  强制重新编译 llama.cpp
   --skip-apt       跳过 apt 安装，适合无 sudo/root 环境
   -h, --help       显示帮助
@@ -136,7 +136,7 @@ while [[ $# -gt 0 ]]; do
     --stop) STOP_AFTER_SETUP="1" ;;
     --restart) RESTART_AFTER_SETUP="1"; START_AFTER_SETUP="1" ;;
     --status) STATUS_ONLY="1" ;;
-    --tunnel) USE_TUNNEL="1" ;;
+    --tunnel) USE_TUNNEL="1"; START_AFTER_SETUP="1" ;;
     --force-rebuild) FORCE_REBUILD="1" ;;
     --skip-apt) SKIP_APT="1" ;;
     -h|--help) usage; exit 0 ;;
@@ -293,6 +293,15 @@ model_file_ok() {
   size="$(stat -c '%s' "$MODEL_PATH" 2>/dev/null || echo 0)"
   [[ "$size" -gt 1000000000 ]]
 }
+format_bytes_gb() {
+  local bytes="${1:-0}"
+  awk -v b="$bytes" 'BEGIN {printf "%.2f", b/1000000000}'
+}
+
+format_bytes_kb() {
+  local bytes="${1:-0}"
+  awk -v b="$bytes" 'BEGIN {printf "%.2f", b/1000}'
+}
 
 remove_tiny_model_file_if_any() {
   [[ -f "$MODEL_PATH" ]] || return 0
@@ -300,7 +309,7 @@ remove_tiny_model_file_if_any() {
   size="$(stat -c '%s' "$MODEL_PATH" 2>/dev/null || echo 0)"
   # curl 在无 -f 时可能把 404/HTML/Xet 错误页保存成同名小文件；断点续传前先清掉。
   if [[ "$size" -gt 0 && "$size" -lt 1000000 ]]; then
-    warn "删除疑似错误页/残缺小文件：$MODEL_PATH ($(awk "BEGIN {printf \"%.2f\", $size/1000}") KB)"
+    warn "删除疑似错误页/残缺小文件：$MODEL_PATH ($(format_bytes_kb "$size") KB)"
     rm -f "$MODEL_PATH"
   fi
 }
@@ -325,7 +334,7 @@ print_download_progress_hint() {
   if [[ -f "$MODEL_PATH" ]]; then
     size="$(stat -c '%s' "$MODEL_PATH" 2>/dev/null || echo 0)"
   fi
-  log "当前已下载：$(awk "BEGIN {printf "%.2f", $size/1000000000}") GB -> $MODEL_PATH"
+  log "当前已下载：$(format_bytes_gb "$size") GB -> $MODEL_PATH"
 }
 
 download_with_hf_cli() {
@@ -511,7 +520,7 @@ use_local_uploaded_model_if_any() {
     return 0
   fi
 
-  log "发现本地上传模型：$src ($(awk "BEGIN {printf "%.2f", $size/1000000000}") GB)"
+  log "发现本地上传模型：$src ($(format_bytes_gb "$size") GB)"
   log "准备放到运行路径：$MODEL_PATH"
   if [[ "$MODEL_LINK_MODE" == "symlink" ]]; then
     ln -sf "$src" "$MODEL_PATH"
@@ -527,14 +536,14 @@ download_model() {
   if use_local_uploaded_model_if_any && model_file_ok; then
     local size
     size="$(stat -c '%s' "$MODEL_PATH" 2>/dev/null || echo 0)"
-    log "本地上传模型就绪：$MODEL_PATH ($(awk "BEGIN {printf "%.2f", $size/1000000000}") GB)"
+    log "本地上传模型就绪：$MODEL_PATH ($(format_bytes_gb "$size") GB)"
     return 0
   fi
 
   if model_file_ok; then
     local size
     size="$(stat -c '%s' "$MODEL_PATH" 2>/dev/null || echo 0)"
-    log "模型已存在：$MODEL_PATH ($(awk "BEGIN {printf "%.2f", $size/1000000000}") GB)"
+    log "模型已存在：$MODEL_PATH ($(format_bytes_gb "$size") GB)"
     return 0
   fi
 
@@ -542,9 +551,17 @@ download_model() {
   log "下载策略：MODEL_PROVIDER=$MODEL_PROVIDER HF_ENDPOINT=$HF_ENDPOINT MODELSCOPE_MODEL_ID=${MODELSCOPE_MODEL_ID:-<empty>}"
 
   if [[ "$MODEL_PROVIDER" == "modelscope" || "$MODEL_PROVIDER" == "auto" ]]; then
-    download_with_modelscope_cli || warn "modelscope CLI 下载失败或不可用，切换到 ModelScope Python。"
-    if ! model_file_ok; then
-      download_with_modelscope_python || warn "ModelScope Python 下载失败或不可用。"
+    if [[ -z "$MODELSCOPE_MODEL_ID" ]]; then
+      if [[ "$MODEL_PROVIDER" == "modelscope" ]]; then
+        err "MODEL_PROVIDER=modelscope 但 MODELSCOPE_MODEL_ID 未设置。"
+        exit 1
+      fi
+      log "未设置 MODELSCOPE_MODEL_ID，跳过 ModelScope 下载，改用 HF/hf-mirror。"
+    else
+      download_with_modelscope_cli || warn "modelscope CLI 下载失败或不可用，切换到 ModelScope Python。"
+      if ! model_file_ok; then
+        download_with_modelscope_python || warn "ModelScope Python 下载失败或不可用。"
+      fi
     fi
   fi
 
@@ -580,7 +597,7 @@ download_model() {
     err "或手动下载到该路径后再运行脚本。"
     exit 1
   fi
-  log "模型下载完成：$MODEL_PATH ($(awk "BEGIN {printf "%.2f", $size/1000000000}") GB)"
+  log "模型下载完成：$MODEL_PATH ($(format_bytes_gb "$size") GB)"
 }
 
 write_runtime_scripts() {

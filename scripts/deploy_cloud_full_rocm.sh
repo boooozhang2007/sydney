@@ -7,6 +7,7 @@
 #
 # 用法：
 #   bash scripts/deploy_cloud_full_rocm.sh
+#   bash scripts/deploy_cloud_full_rocm.sh --console-only   # 只启动/暴露控制台，不重启模型
 
 set -Eeuo pipefail
 
@@ -46,6 +47,10 @@ QWEN_DISABLE_CUDA_GRAPH="${QWEN_DISABLE_CUDA_GRAPH:-1}"
 QWEN_CLEAR_COMPILE_CACHE="${QWEN_CLEAR_COMPILE_CACHE:-1}"
 QWEN_STARTUP_TIMEOUT_SEC="${QWEN_STARTUP_TIMEOUT_SEC:-900}"
 VLLM_EXTRA_ARGS="${VLLM_EXTRA_ARGS:-}"
+VLLM_HELP_TIMEOUT_SEC="${VLLM_HELP_TIMEOUT_SEC:-45}"
+# ROCm 镜像里 `python -m vllm.entrypoints.openai.api_server --help` 可能导入很慢甚至卡住；
+# 默认不做动态探测，只传 vLLM 0.20.x ROCm 常用稳定参数。需要动态兼容时可设为 0。
+VLLM_SKIP_OPTION_PROBE="${VLLM_SKIP_OPTION_PROBE:-1}"
 # ROCm/vLLM 0.20.x 对 Qwen3.6 的 GDN/aiter/chunked prefill 组合比较敏感。
 # safe-mode 保持 max-num-seqs=64，但降低单次 batched tokens，并关闭容易触发 HIP illegal access 的启动路径。
 QWEN_ROCM_SAFE_MODE="${QWEN_ROCM_SAFE_MODE:-1}"
@@ -59,7 +64,7 @@ QWEN_USE_AITER="${QWEN_USE_AITER:-0}"
 QWEN_REASONING_PARSER="${QWEN_REASONING_PARSER:-}"
 SKIP_VLLM_CHECK="${SKIP_VLLM_CHECK:-0}"
 
-LLAMA_DIR="${LLAMA_DIR:-/workspace/llama.cpp-rocm}"
+LLAMA_DIR="${LLAMA_DIR:-/workspace/sydney_rocm/llama.cpp}"
 
 CLOUDFLARED_LOCAL_PATH="${CLOUDFLARED_LOCAL_PATH:-/mnt/cloudflared}"
 CLOUDFLARED_URL="${CLOUDFLARED_URL:-https://gh.llkk.cc/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64}"
@@ -69,6 +74,36 @@ STACK_DIR="${STACK_DIR:-/workspace/sydney_cloud_stack}"
 LOG_DIR="$STACK_DIR/logs"
 RUN_DIR="$STACK_DIR/run"
 BIN_DIR="$STACK_DIR/bin"
+CONSOLE_ONLY="0"
+SKIP_MODEL_START="0"
+
+usage(){
+  cat <<'USAGE'
+云端全流程部署 Sydney + Qwen + Web 控制台，并且只把 Web 控制台暴露到 Cloudflare Tunnel。
+
+Usage:
+  bash scripts/deploy_cloud_full_rocm.sh [options]
+
+Options:
+  --console-only   只启动 Web 控制台和控制台 Tunnel，不启动/重启两个模型
+  --skip-models    同 --console-only
+  -h, --help       显示帮助
+
+默认：
+  Sydney: 127.0.0.1:8000  parallel=64 ctx_size=262144
+  Qwen:   127.0.0.1:8010  max_num_seqs=64
+  Console tunnel: Cloudflare -> http://127.0.0.1:7860
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --console-only|--skip-models) CONSOLE_ONLY="1"; SKIP_MODEL_START="1" ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown option: $1" >&2; usage; exit 2 ;;
+  esac
+  shift
+done
 
 log(){ printf '\033[1;36m[cloud-stack]\033[0m %s\n' "$*"; }
 warn(){ printf '\033[1;33m[warn]\033[0m %s\n' "$*" >&2; }
@@ -92,6 +127,10 @@ pip_install(){
 }
 
 check_vllm(){
+  if [[ "$SKIP_MODEL_START" == "1" ]]; then
+    warn "console-only: 跳过 vLLM 检查。"
+    return 0
+  fi
   if [[ "$SKIP_VLLM_CHECK" == "1" ]]; then
     warn "已跳过 vLLM 检查：SKIP_VLLM_CHECK=1"
     return 0
@@ -222,19 +261,44 @@ PY
 
 vllm_help_file(){ echo "$RUN_DIR/vllm-api-server.help"; }
 refresh_vllm_help(){
-  local hf
+  local hf tmp rc=0
   hf="$(vllm_help_file)"
-  if [[ ! -s "$hf" || "${VLLM_REFRESH_HELP:-0}" == "1" ]]; then
-    python3 -m vllm.entrypoints.openai.api_server --help > "$hf" 2>&1 || true
+  if [[ "$VLLM_SKIP_OPTION_PROBE" == "1" ]]; then
+    [[ "${_VLLM_HELP_SKIP_LOGGED:-0}" == "1" ]] || warn "已跳过 vLLM CLI 参数探测：VLLM_SKIP_OPTION_PROBE=1"
+    _VLLM_HELP_SKIP_LOGGED=1
+    : > "$hf"
+    return 0
   fi
+  [[ "${_VLLM_HELP_PROBED:-0}" == "1" ]] && return 0
+  [[ -e "$hf" && "${VLLM_REFRESH_HELP:-0}" != "1" ]] && return 0
+  _VLLM_HELP_PROBED=1
+  tmp="$hf.tmp"
+  rm -f "$tmp"
+  log "探测 vLLM CLI 参数（最多 ${VLLM_HELP_TIMEOUT_SEC}s；首次导入 vLLM 可能较慢）"
+  if have timeout; then
+    timeout "$VLLM_HELP_TIMEOUT_SEC" python3 -m vllm.entrypoints.openai.api_server --help > "$tmp" 2>&1 || rc=$?
+  else
+    python3 -m vllm.entrypoints.openai.api_server --help > "$tmp" 2>&1 || rc=$?
+  fi
+  if [[ "$rc" == "0" && -s "$tmp" ]]; then
+    mv "$tmp" "$hf"
+    return 0
+  fi
+  warn "vLLM CLI 参数探测失败/超时（rc=$rc），将跳过无法确认的可选参数，避免卡在 --help。"
+  [[ -s "$tmp" ]] && tail -n 40 "$tmp" >&2 || true
+  : > "$hf"
+  rm -f "$tmp"
 }
 vllm_supports(){ local flag="$1"; refresh_vllm_help; grep -q -- "$flag" "$(vllm_help_file)" 2>/dev/null; }
 
 vllm_envs_file(){ echo "$RUN_DIR/vllm-envs.list"; }
 refresh_vllm_envs(){
   local ef; ef="$(vllm_envs_file)"
-  [[ -s "$ef" && "${VLLM_REFRESH_ENVS:-0}" != "1" ]] && return 0
-  python3 - <<'PY' > "$ef" 2>/dev/null || true
+  [[ "${_VLLM_ENVS_PROBED:-0}" == "1" ]] && return 0
+  [[ -e "$ef" && "${VLLM_REFRESH_ENVS:-0}" != "1" ]] && return 0
+  _VLLM_ENVS_PROBED=1
+  if have timeout; then
+    timeout "$VLLM_HELP_TIMEOUT_SEC" python3 - <<'PY' > "$ef" 2>/dev/null || : > "$ef"
 try:
     import vllm.envs as envs
     names = set()
@@ -248,6 +312,22 @@ try:
 except Exception:
     pass
 PY
+  else
+    python3 - <<'PY' > "$ef" 2>/dev/null || : > "$ef"
+try:
+    import vllm.envs as envs
+    names = set()
+    for obj_name in ('environment_variables', 'ENV_VARS'):
+        obj = getattr(envs, obj_name, None)
+        if isinstance(obj, dict):
+            names.update(str(k) for k in obj.keys())
+    names.update(n for n in dir(envs) if n.isupper())
+    for n in sorted(names):
+        print(n)
+except Exception:
+    pass
+PY
+  fi
 }
 vllm_env_known(){ local name="$1"; refresh_vllm_envs; grep -qx -- "$name" "$(vllm_envs_file)" 2>/dev/null; }
 export_vllm_env_if_known(){
@@ -257,15 +337,41 @@ export_vllm_env_if_known(){
   else
     [[ "${3:-0}" == "1" ]] && warn "当前 vLLM 不识别环境变量 $name，已跳过，避免 unknown env 警告。"
   fi
+  return 0
 }
-append_vllm_switch(){ local arr_name="$1" flag="$2"; local -n _arr="$arr_name"; if vllm_supports "$flag"; then _arr+=("$flag"); else [[ "${3:-0}" == "1" ]] && warn "当前 vLLM 不支持参数 $flag，已跳过。"; fi; }
-append_vllm_option(){ local arr_name="$1" flag="$2" value="$3"; local -n _arr="$arr_name"; if vllm_supports "$flag"; then _arr+=("$flag" "$value"); else [[ "${4:-0}" == "1" ]] && warn "当前 vLLM 不支持参数 $flag，已跳过。"; fi; }
+append_vllm_switch(){
+  local arr_name="$1" flag="$2"; local -n _arr="$arr_name"
+  if [[ "$VLLM_SKIP_OPTION_PROBE" == "1" ]]; then
+    case "$flag" in
+      --trust-remote-code|--enforce-eager) _arr+=("$flag") ;;
+      --language-model-only|--disable-async-output-proc|--disable-cudagraph) [[ "${3:-0}" == "1" ]] && warn "已跳过可选参数 $flag：VLLM_SKIP_OPTION_PROBE=1" ;;
+      *) [[ "${3:-0}" == "1" ]] && warn "已跳过未知可选参数 $flag：VLLM_SKIP_OPTION_PROBE=1" ;;
+    esac
+    return 0
+  fi
+  if vllm_supports "$flag"; then _arr+=("$flag"); else [[ "${3:-0}" == "1" ]] && warn "当前 vLLM 不支持参数 $flag，已跳过。"; fi
+  return 0
+}
+append_vllm_option(){
+  local arr_name="$1" flag="$2" value="$3"; local -n _arr="$arr_name"
+  if [[ "$VLLM_SKIP_OPTION_PROBE" == "1" ]]; then
+    [[ "${4:-0}" == "1" ]] && warn "已跳过可选参数 $flag：VLLM_SKIP_OPTION_PROBE=1"
+    return 0
+  fi
+  if vllm_supports "$flag"; then _arr+=("$flag" "$value"); else [[ "${4:-0}" == "1" ]] && warn "当前 vLLM 不支持参数 $flag，已跳过。"; fi
+  return 0
+}
 append_vllm_disable_bool(){
   local arr_name="$1" flag="$2"; local -n _arr="$arr_name"
+  if [[ "$VLLM_SKIP_OPTION_PROBE" == "1" ]]; then
+    [[ "${3:-0}" == "1" ]] && warn "已跳过布尔可选参数 $flag：VLLM_SKIP_OPTION_PROBE=1"
+    return 0
+  fi
   local no_flag="--no-${flag#--}"
   local disable_flag="$flag"
   if [[ "$flag" == --enable-* ]]; then disable_flag="--disable-${flag#--enable-}"; fi
   if vllm_supports "$no_flag"; then _arr+=("$no_flag"); elif [[ "$disable_flag" != "$flag" ]] && vllm_supports "$disable_flag"; then _arr+=("$disable_flag"); else [[ "${3:-0}" == "1" ]] && warn "当前 vLLM 未暴露关闭 $flag 的 CLI 参数，已跳过。"; fi
+  return 0
 }
 apply_qwen_rocm_safe_defaults(){
   [[ "$QWEN_ROCM_SAFE_MODE" == "1" ]] || return 0
@@ -351,6 +457,7 @@ start_qwen_vllm(){
   log "model=$QWEN_MODEL_DIR max_model_len=$QWEN_MAX_MODEL_LEN max_num_seqs=$QWEN_MAX_NUM_SEQS gpu_memory_utilization=$effective_gpu_util"
   apply_qwen_rocm_safe_defaults
   apply_qwen_vllm_envs
+  log "准备构造 vLLM 参数；如果长时间停住，通常是在探测 vLLM --help。"
   local vllm_args=(
     --host 127.0.0.1
     --port "$QWEN_PORT"
@@ -515,6 +622,15 @@ start_console_tunnel(){
   cfbin="$(ensure_cloudflared)"
   if [[ -f "$RUN_DIR/cloudflared.pid" ]] && kill -0 "$(cat "$RUN_DIR/cloudflared.pid")" 2>/dev/null; then
     log "控制台 CF tunnel 已在运行：PID=$(cat "$RUN_DIR/cloudflared.pid")"
+    if ! grep -q "127.0.0.1:$APP_PORT" "$LOG_DIR/cloudflared-console.log" 2>/dev/null; then
+      warn "已有 cloudflared 可能不是指向控制台端口 $APP_PORT，重启控制台 tunnel。"
+      kill "$(cat "$RUN_DIR/cloudflared.pid")" 2>/dev/null || true
+      sleep 2
+      kill -9 "$(cat "$RUN_DIR/cloudflared.pid")" 2>/dev/null || true
+      rm -f "$RUN_DIR/cloudflared.pid"
+      nohup "$cfbin" tunnel --url "http://127.0.0.1:$APP_PORT" > "$LOG_DIR/cloudflared-console.log" 2>&1 &
+      echo $! > "$RUN_DIR/cloudflared.pid"
+    fi
   else
     log "启动唯一 Cloudflare Tunnel -> http://127.0.0.1:$APP_PORT"
     nohup "$cfbin" tunnel --url "http://127.0.0.1:$APP_PORT" > "$LOG_DIR/cloudflared-console.log" 2>&1 &
@@ -565,11 +681,20 @@ main(){
   clone_or_update_repo
   install_repo_requirements
   write_management_scripts
-  start_sydney
-  start_qwen_vllm
+  if [[ "$SKIP_MODEL_START" == "1" ]]; then
+    warn "console-only: 不启动/重启 Sydney 和 Qwen；只写 .env、启动 Web 控制台和控制台 tunnel。"
+  else
+    start_sydney
+    start_qwen_vllm
+  fi
   write_cloud_env
   start_app
   start_console_tunnel
+  echo
+  echo "控制台说明："
+  echo "  Cloudflare Tunnel 只指向 Web 控制台 http://127.0.0.1:$APP_PORT"
+  echo "  模型端口仅本机可访问：Sydney=$SYDNEY_PORT, Qwen=$QWEN_PORT"
+  echo "  页面生成数据时会让 Sydney(source) 与 Qwen(simulator/translator/judge) 在内网互相调用。"
   echo
   echo "管理命令："
   echo "  bash $APP_DIR/scripts/manage_cloud_models.sh status"
