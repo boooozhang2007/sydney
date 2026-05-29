@@ -6,6 +6,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -529,6 +530,27 @@ def get_existing_texts() -> List[tuple[str, str]]:
     return [(row["id"], conversation_text(json.loads(row["messages_json"]))) for row in rows]
 
 
+def get_existing_topic_counts() -> Dict[str, int]:
+    """统计历史样本的 topic_id 覆盖次数，用于新批次少见话题优先。
+
+    这样做可以避免“每次生成 100 条都碰巧重复同几个话题”的长期偏差。
+    老样本如果还没有 topic_id，会自动跳过，不影响兼容。
+    """
+
+    counts: Counter[str] = Counter()
+    with db() as conn:
+        rows = conn.execute("SELECT spec_json FROM samples").fetchall()
+    for row in rows:
+        try:
+            spec = json.loads(row["spec_json"])
+        except Exception:
+            continue
+        topic_id = str(spec.get("topic_id") or "").strip()
+        if topic_id:
+            counts[topic_id] += 1
+    return dict(counts)
+
+
 def write_status_mirror(sample: Dict[str, Any]) -> None:
     """把每条样本镜像成独立 JSON，便于手工检查和版本管理。"""
 
@@ -698,6 +720,7 @@ def run_generation_job(
         # 开源 Sydney GGUF 的英文分布明显强于中文；即使关闭翻译，也保留英文源对话。
         source_language="en",
         target_language="zh-CN",
+        previous_topic_counts=get_existing_topic_counts(),
     )
     existing = get_existing_texts()
     generated: List[Dict[str, Any]] = []

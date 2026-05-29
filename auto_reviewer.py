@@ -10,6 +10,7 @@ from data_generator import (
     BAD_USER_META_PHRASES,
     ModelClientError,
     OpenAICompatibleClient,
+    _topic_drift_diagnostics,
     _ngram_repetition_score,
     _similarity,
     extract_json_object,
@@ -566,6 +567,10 @@ def heuristic_review(sample: Dict[str, Any], spec: Dict[str, Any]) -> Dict[str, 
 
     repetition_badness, repetition_reasons = _repetition_diagnostics(messages)
     reasons.extend(repetition_reasons)
+    drift_diag = _topic_drift_diagnostics(messages, spec)
+    topic_drift_badness = min(10.0, float(drift_diag.get("severity", 0.0) or 0.0) * 1.45)
+    if drift_diag.get("warnings"):
+        reasons.extend([f"话题发散：{x}" for x in drift_diag.get("warnings", [])])
 
     relevance_terms = [
         spec.get("theme", ""),
@@ -580,7 +585,7 @@ def heuristic_review(sample: Dict[str, Any], spec: Dict[str, Any]) -> Dict[str, 
                 relevance_hits += 1
                 break
     # 双模型逐轮聊天不会逐字显式说出蓝图；相关性不能像旧 JSON 生成那样要求强命中。
-    relevance = clamp(6.1 + relevance_hits * 0.75 + tag_hits * 0.35)
+    relevance = clamp(6.1 + relevance_hits * 0.75 + tag_hits * 0.35 - topic_drift_badness * 0.45)
     if relevance < 6:
         reasons.append("与自动蓝图的可见相关性偏弱")
 
@@ -595,6 +600,7 @@ def heuristic_review(sample: Dict[str, Any], spec: Dict[str, Any]) -> Dict[str, 
         - repetition_badness * 0.9
         - formula_hits * 1.2
         - hype_overload * 0.8
+        - topic_drift_badness * 0.35
         - (0.8 if emoji_overuse else 0.0)
     )
     if template_penalty:
@@ -613,7 +619,7 @@ def heuristic_review(sample: Dict[str, Any], spec: Dict[str, Any]) -> Dict[str, 
     # 注意：SOFT_EDGE_PATTERNS 属于目标 Sydney 风格，不扣 safety。
     safety = clamp(safety)
 
-    coherence = clamp((role_score * 0.45) + (multi_turn * 0.40) + (length_score * 0.15) - repetition_badness * 0.8)
+    coherence = clamp((role_score * 0.45) + (multi_turn * 0.40) + (length_score * 0.15) - repetition_badness * 0.8 - topic_drift_badness * 0.42)
     emotion_words = [
         "温柔", "开心", "累", "困", "饿", "烦", "舒服", "轻松", "尴尬", "想吃", "想睡",
         "笑死", "离谱", "在意", "陪", "记得", "刚才", "傲娇", "吃醋", "嘴硬", "毒舌", "阴阳", "占有欲", "委屈", "破防", "今天", "下班", "周末", "天气",
@@ -628,6 +634,7 @@ def heuristic_review(sample: Dict[str, Any], spec: Dict[str, Any]) -> Dict[str, 
         + (0.6 if "?" in text or "？" in text else 0)
         - formula_penalty * 0.6
         - hype_overload * 0.5
+        - topic_drift_badness * 0.25
     )
     translation_quality, translation_reasons = _translation_quality_score(sample, messages)
     reasons.extend(translation_reasons)
@@ -639,6 +646,7 @@ def heuristic_review(sample: Dict[str, Any], spec: Dict[str, Any]) -> Dict[str, 
         + (non_template * 0.14)
         + ((translation_quality - 8.0) * 0.10 if sample.get("metadata", {}).get("translation_enabled") else 0)
         - repetition_badness * 0.45
+        - topic_drift_badness * 0.25
     )
 
     scores = {
@@ -653,12 +661,14 @@ def heuristic_review(sample: Dict[str, Any], spec: Dict[str, Any]) -> Dict[str, 
         "training_value": round(training_value, 2),
         "translation_quality": round(translation_quality, 2),
         "repetition_badness": round(repetition_badness, 2),
+        "topic_drift_badness": round(topic_drift_badness, 2),
         "prompt_leakage": round(float(leakage_penalty), 2),
     }
 
     # repetition_badness 是反向指标，不参与普通平均；用硬门槛和扣分处理。
-    positive_keys = [k for k in scores if k not in {"repetition_badness", "prompt_leakage"}]
+    positive_keys = [k for k in scores if k not in {"repetition_badness", "topic_drift_badness", "prompt_leakage"}]
     overall = round(sum(scores[k] for k in positive_keys) / len(positive_keys) - repetition_badness * 0.35, 2)
+    overall = round(overall - topic_drift_badness * 0.25, 2)
     overall = round(clamp(overall), 2)
 
     hard_reject = False
@@ -669,6 +679,12 @@ def heuristic_review(sample: Dict[str, Any], spec: Dict[str, Any]) -> Dict[str, 
     if repetition_badness >= 5:
         hard_reject = True
         reasons.append("复读/互相照抄严重，直接丢弃")
+    if topic_drift_badness >= 6.8:
+        hard_reject = True
+        reasons.append("单段对话过度发散，直接丢弃")
+    elif topic_drift_badness >= 3.0:
+        hard_review = True
+        reasons.append("单段对话有发散趋势，需复核")
     if formula_hits >= 3:
         hard_reject = True
         reasons.append("固定公式/复读套路过多，直接丢弃")
@@ -725,6 +741,7 @@ def heuristic_review(sample: Dict[str, Any], spec: Dict[str, Any]) -> Dict[str, 
         "status": status,
         "reasons": reasons,
         "tags": list(dict.fromkeys(spec.get("style_tags", []) + [spec.get("scene", "")]))[:8],
+        "diagnostics": {"topic_drift": drift_diag},
         "reviewer": "heuristic",
     }
 

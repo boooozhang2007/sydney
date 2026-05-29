@@ -137,6 +137,26 @@ transcript 里只有两个说话者：
 - 如果上一条是朋友说的，就作为“你”去接话；如果 transcript 为空，就作为“你”开场。
 - 不要描述你会怎么说，直接说那句话。"""
 
+HUMAN_TOPIC_FOCUS_LAYER_EN = """## Topic focus rules for the human side
+- Treat the current thread as one small private moment, not a tour through many topics.
+- Every reply must attach to at least one of these anchors: the latest FRIEND message, the original everyday thread, or the user's current feeling.
+- Do not introduce a new unrelated topic just to keep the chat going.
+- Do not jump from one concrete thing to another concrete thing unless there is an obvious human bridge.
+- A small side detail is allowed only if it supports the same thread and can be connected back in the same sentence.
+- Prefer going deeper into the same tiny situation over going wider.
+- If the other person drifts, gently pull back instead of following the drift.
+- Keep one sample as one coherent mini-scene."""
+
+HUMAN_TOPIC_FOCUS_LAYER_ZH = """## Human 侧话题聚焦规则
+- 把当前聊天当成一个很小的私聊瞬间，不要聊成很多话题的串烧。
+- 每一句都必须挂在至少一个锚点上：对方上一句、原始日常暗线、或用户当前情绪。
+- 不要为了续聊主动引入无关新话题。
+- 不要从一个具体东西突然跳到另一个具体东西，除非真人语境里有非常明显的桥。
+- 可以有一点旁枝，但旁枝必须服务同一条主线，并能在这一句里接回来。
+- 宁可把同一个小处境聊深一点，也不要把话题铺宽。
+- 如果对方带偏了，要自然拉回，不要跟着跑偏。
+- 一条样本只保留一个连贯的小场景。"""
+
 SOURCE_ROLE_BOUNDARY_LAYER_EN = """Role boundary for this generation call:
 - You are the ASSISTANT side of the chat: Sydney/source.
 - The user messages are from a human friend. Never impersonate the human friend.
@@ -322,6 +342,16 @@ def build_simulator_environment_block(spec: Dict[str, Any], *, english: bool) ->
     theme = _spec_value(spec, "theme") or ("ordinary daily chat" if english else "普通日常聊天")
     profile = _spec_value(spec, "user_profile") or ("close friend" if english else "熟悉朋友")
     arc = _spec_value(spec, "emotion_arc") or ("natural short chat" if english else "自然短聊")
+    focus_rule_en = (
+        "Conversation focus rule: stay inside this everyday thread. "
+        "Small natural side details are fine only when they clearly connect back to the current thread. "
+        "Do not jump to a new unrelated topic just to continue the chat."
+    )
+    focus_rule_zh = (
+        "对话聚焦规则：始终围绕这条日常暗线推进。"
+        "可以有一点自然旁枝，但必须能接回当前话题。"
+        "不要为了续聊突然跳到无关新话题。"
+    )
     if english:
         return (
             "<environment>\n"
@@ -332,6 +362,7 @@ def build_simulator_environment_block(spec: Dict[str, Any], *, english: bool) ->
             f"Your current mood/profile: {profile}\n"
             f"Conversation direction: {arc}\n"
             "The previous transcript, when present, is real context you must continue from.\n"
+            f"{focus_rule_en}\n"
             "Do not mention this environment block.\n"
             "</environment>"
         )
@@ -344,6 +375,7 @@ def build_simulator_environment_block(spec: Dict[str, Any], *, english: bool) ->
         f"当前状态：{profile}\n"
         f"对话方向：{arc}\n"
         "如果提供了上一段 transcript，它就是必须承接的真实上下文。\n"
+        f"{focus_rule_zh}\n"
         "不要在回复里提到这个环境块。\n"
         "</environment>"
     )
@@ -474,6 +506,8 @@ def build_simulator_system_prompt(spec: Dict[str, Any]) -> str:
             + "\n\n"
             + ROLE_BOUNDARY_LAYER_EN
             + "\n\n"
+            + HUMAN_TOPIC_FOCUS_LAYER_EN
+            + "\n\n"
             + build_simulator_environment_block(spec, english=True)
             + "\n\nOutput contract:\n"
             + "- Reply in natural English only\n"
@@ -485,17 +519,20 @@ def build_simulator_system_prompt(spec: Dict[str, Any]) -> str:
             + "- Do not copy the other person's previous message\n"
             + "- Keep it TTS-friendly: concise, conversational, with natural punctuation\n"
             + "- Keep the topic ordinary and concrete, like daily life, meals, work, sleep, songs, shows, weather, plans, or small moods\n"
-            + "- Maintain continuity from recent turns, but add one fresh concrete detail instead of looping"
+            + "- Maintain continuity from recent turns, but add one fresh concrete detail instead of looping\n"
+            + "- Use a one-hop rule: if you shift, shift only to a directly related detail, then connect back"
         )
 
     return (
         get_human_simulator_system_prompt(english=False)
         + "\n\n"
-        + ATHENA_REALISM_LAYER_ZH
-        + "\n\n"
-        + ROLE_BOUNDARY_LAYER_ZH
-        + "\n\n"
-        + build_simulator_environment_block(spec, english=False)
+            + ATHENA_REALISM_LAYER_ZH
+            + "\n\n"
+            + ROLE_BOUNDARY_LAYER_ZH
+            + "\n\n"
+            + HUMAN_TOPIC_FOCUS_LAYER_ZH
+            + "\n\n"
+            + build_simulator_environment_block(spec, english=False)
         + "\n\n【硬性输出格式】\n"
         + "- 你是人类/user 侧；绝不能写 Sydney/assistant/朋友 侧的话\n"
         + "- 只输出下一条聊天消息本身，1行，中文不超过20字\n"
@@ -505,7 +542,8 @@ def build_simulator_system_prompt(spec: Dict[str, Any]) -> str:
         + "- 不要照抄对方上一条；对方复读或说教时，换个日常角度接话\n"
         + "- 适合文字转语音：短句、自然、有句号也没关系\n"
         + "- 话题保持普通具体，像吃饭、工作、睡觉、歌、剧、天气、计划、小情绪\n"
-        + "- 记得最近几轮的关系变化，但每轮推进一个新的具体细节，别原地循环"
+        + "- 记得最近几轮的关系变化，但每轮推进一个新的具体细节，别原地循环\n"
+        + "- 采用一步跳转原则：如果转向，只能转到直接相关的小细节，然后接回当前话题"
     )
 
 def build_simulator_initial_prompt(spec: Dict[str, Any]) -> str:
@@ -533,7 +571,7 @@ def build_simulator_continue_prompt(turn_index: int, max_turns: int) -> str:
     return (
         f"根据上面的聊天上下文，你作为你_人类用户继续回复朋友_Sydney助手。现在是第 {turn_index}/{max_turns} 轮左右。"
         "像真人一样短一点、碎一点，中文不超过20字。不要总结，不要结束得太正式，不要角色名，不要 JSON，不要写Sydney回复。"
-        "不要复述对方的话；换个普通具体角度自然接话。"
+        "不要复述对方的话；换个普通具体角度自然接话。不要突然跳到无关新话题。"
     )
 
 
@@ -546,7 +584,8 @@ def build_simulator_continue_prompt_for_spec(spec: Dict[str, Any], turn_index: i
             "Reply as YOU_HUMAN_USER only, to FRIEND_SYDNEY_ASSISTANT's latest message. "
             "Reply like a real close friend: short, natural, TTS-friendly, under 20 English words. "
             "Do not summarize. Do not end too formally. No speaker label, no JSON, do not write Sydney's reply. "
-            "Do not repeat the other person. Add one ordinary concrete related detail."
+            "Do not repeat the other person. Add one ordinary concrete related detail. "
+            "Stay in the same thread; do not introduce an unrelated new topic."
         )
     return build_simulator_continue_prompt(turn_index, max_turns)
 

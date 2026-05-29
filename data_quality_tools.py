@@ -20,7 +20,7 @@ from typing import Any, Dict, List
 
 from auto_reviewer import heuristic_review
 from deduper import conversation_text, fingerprint
-from data_generator import to_sharegpt
+from data_generator import SYDNEY_TOPIC_TIERS, topic_id_for, to_sharegpt
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
@@ -120,6 +120,10 @@ def report(limit: int = 200) -> Dict[str, Any]:
         rows = conn.execute("SELECT * FROM samples ORDER BY updated_at DESC LIMIT ?", (limit,)).fetchall()
     status = collections.Counter()
     tier = collections.Counter()
+    topic = collections.Counter()
+    scene = collections.Counter()
+    profile = collections.Counter()
+    arc = collections.Counter()
     issues = []
     aggregates = collections.defaultdict(list)
     for row in rows:
@@ -133,7 +137,16 @@ def report(limit: int = 200) -> Dict[str, Any]:
         hype = marker_count(text, HYPE)
         vuln = marker_count(atext, VULN)
         status[sample["status"]] += 1
-        tier[sample.get("spec", {}).get("topic_tier", "unknown")] += 1
+        spec = sample.get("spec", {})
+        tier[spec.get("topic_tier", "unknown")] += 1
+        if spec.get("topic_id"):
+            topic[spec.get("topic_id")] += 1
+        if spec.get("scene_id"):
+            scene[spec.get("scene_id")] += 1
+        if spec.get("user_profile_id"):
+            profile[spec.get("user_profile_id")] += 1
+        if spec.get("emotion_arc_id"):
+            arc[spec.get("emotion_arc_id")] += 1
         aggregates["turns"].append(len(assistants))
         aggregates["formula"].append(f)
         aggregates["emoji"].append(emoji)
@@ -151,10 +164,33 @@ def report(limit: int = 200) -> Dict[str, Any]:
                 "vulnerability": vuln,
                 "preview": atext[:180].replace("\n", " "),
             })
+    all_topics = [
+        topic_id_for(tier_name, topic_obj)
+        for tier_name, topic_list in SYDNEY_TOPIC_TIERS.items()
+        for topic_obj in topic_list
+    ]
+    covered_topics = [x for x in all_topics if topic.get(x, 0) > 0]
+    missing_topics = [x for x in all_topics if topic.get(x, 0) == 0]
     summary = {
         "total": len(rows),
         "status": dict(status),
         "topic_tier": dict(tier),
+        "topic_coverage": {
+            "covered": len(covered_topics),
+            "total": len(all_topics),
+            "coverage_ratio": round(len(covered_topics) / max(1, len(all_topics)), 4),
+            "expected_topic_pool": {
+                tier_name: len(topic_list)
+                for tier_name, topic_list in SYDNEY_TOPIC_TIERS.items()
+            },
+            "missing": missing_topics,
+            "counts": dict(topic),
+        },
+        "axis_coverage": {
+            "scene": dict(scene),
+            "user_profile": dict(profile),
+            "emotion_arc": dict(arc),
+        },
         "averages": {k: round(sum(v) / max(1, len(v)), 3) for k, v in aggregates.items()},
         "top_issues": sorted(issues, key=lambda x: (x["formula"], x["hype"], x["emoji"]), reverse=True)[:50],
     }

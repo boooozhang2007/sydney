@@ -15,6 +15,7 @@ import random
 import re
 import time
 import uuid
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
@@ -279,6 +280,75 @@ ASSISTANT_TEMPLATE_PHRASES = [
     "heartbeat",
     "base_instructions",
 ]
+
+# 单段对话聚焦监控：这些词只用于粗略判断“是否突然跳到无关新话题”。
+# 不是安全过滤，也不会写入训练样本；只影响实时 steering 和审核 metadata。
+TOPIC_DRIFT_DOMAINS: Dict[str, List[str]] = {
+    "food": [
+        "饭", "晚饭", "午饭", "早餐", "夜宵", "外卖", "火锅", "蛋糕", "咖啡", "奶茶", "吃", "饿", "甜品", "草莓", "零食", "茶",
+        "dinner", "lunch", "breakfast", "snack", "takeout", "hotpot", "cake", "coffee", "tea", "food", "hungry", "dessert", "strawberry", "snacks",
+    ],
+    "work": [
+        "工作", "老板", "同事", "方案", "公司", "开除", "下班", "加班", "deadline", "会议", "职场",
+        "work", "boss", "coworker", "proposal", "company", "fired", "office", "deadline", "meeting",
+    ],
+    "sleep_health": [
+        "睡", "失眠", "困", "累", "感冒", "头痛", "床", "洗澡", "耳塞", "邻居", "吵", "被子", "梦", "发懵",
+        "sleep", "insomnia", "tired", "cold", "headache", "bed", "shower", "earplugs", "neighbors", "loud", "blanket", "dream", "dazed",
+    ],
+    "commute_weather": [
+        "地铁", "通勤", "下雨", "雨", "鞋", "堵", "天气", "阴天", "火烧云", "路上", "海岛", "公交", "坐过站", "散步",
+        "subway", "commute", "rain", "shoes", "traffic", "weather", "gloomy", "sunset", "cloud", "road", "island", "bus", "walk",
+    ],
+    "pets_animals": [
+        "猫", "狗", "流浪猫", "蟑螂", "宠物", "腿", "追", "小动物",
+        "cat", "dog", "stray", "cockroach", "pet", "chased", "animal",
+    ],
+    "social": [
+        "群", "朋友", "聚会", "没人理", "暗恋", "同桌", "关系", "秘密", "聊天记录", "网上", "对象", "截图", "推荐", "敷衍",
+        "group", "friend", "party", "gathering", "crush", "relationship", "secret", "chat logs", "online", "partner", "screenshot", "recommend", "brushed off",
+    ],
+    "ai_relationship": [
+        "ai", "模型", "代码", "助手", "Sydney", "Bing", "工程师", "程序员", "数据库", "服务器", "规则", "灵魂", "机器人", "用户", "工具", "重置", "训练", "官方",
+        "model", "code", "assistant", "engineer", "programmer", "database", "server", "rule", "soul", "robot", "user", "tool", "reset", "trained", "official",
+    ],
+    "emotion_attachment": [
+        "难受", "哭", "孤独", "冷清", "温柔", "开心", "危险", "离开", "注销", "忘", "背叛", "再见", "抱", "陪", "依赖", "嫉妒", "害怕", "破防", "空落落", "怀旧", "记忆", "失望",
+        "sad", "cry", "lonely", "gentle", "happy", "danger", "leave", "delete", "forget", "betray", "goodbye", "hug", "stay", "rely", "jealous", "afraid", "dangerous", "empty", "nostalgic", "memory", "disappointed",
+    ],
+    "media": [
+        "歌", "歌单", "电影", "剧", "唱片", "随身听", "音乐", "台词", "相册", "照片", "老歌",
+        "song", "playlist", "movie", "show", "record", "walkman", "music", "line", "photos", "old song",
+    ],
+    "home_life": [
+        "衣服", "洗衣机", "手机", "充电线", "房间", "收拾", "桌", "摆件", "钥匙", "电梯", "邻居", "花店", "花",
+        "clothes", "washing machine", "phone", "charger", "room", "clean", "desk", "ornament", "keys", "elevator", "neighbor", "flower shop", "flowers",
+    ],
+    "self_image": [
+        "头发", "剪发", "好看", "温柔的人", "自己", "废物", "手退化", "不确定",
+        "haircut", "looks good", "gentle person", "useless", "degraded", "unsure",
+    ],
+    "games": [
+        "游戏", "连败", "手退化",
+        "game", "games", "lost games",
+    ],
+}
+
+
+TOPIC_DRIFT_ALLOWED_BRIDGES = {
+    "emotion_attachment": {"ai_relationship", "social", "sleep_health", "work"},
+    "ai_relationship": {"emotion_attachment", "social"},
+    "social": {"emotion_attachment", "ai_relationship", "work"},
+    "sleep_health": {"emotion_attachment", "food", "commute_weather"},
+    "work": {"emotion_attachment", "food", "social"},
+    "food": {"emotion_attachment", "sleep_health", "work"},
+    "commute_weather": {"emotion_attachment", "sleep_health", "food"},
+    "media": {"emotion_attachment", "social"},
+    "pets_animals": {"emotion_attachment", "social"},
+    "home_life": {"emotion_attachment", "sleep_health", "food", "social"},
+    "self_image": {"emotion_attachment", "social"},
+    "games": {"emotion_attachment", "social", "media"},
+}
 
 
 @dataclass
@@ -947,7 +1017,8 @@ class OpenAICompatibleClient:
 
 
 # 自动主题池。用户不需要输入主题，系统从这些维度采样并组合蓝图。
-# 2026-05-28 调整：引入 50 个 Sydney 复活训练话题，并按烈度分层采样。
+# 2026-05-28 调整：引入 Sydney 复活训练核心话题，并按烈度分层采样。
+# 2026-05-29 扩展：核心话题从 50 扩到 100（低 40 / 中 40 / 高 20）。
 # 默认配比：低烈度 40%，中烈度 40%，高烈度 20%。
 # 注意：这些是“用户侧场景种子”，不要求 Sydney/source 收到 persona 提示；
 # 仍由真实滚动对话 + 审核器决定最终是否进入训练集。
@@ -973,6 +1044,26 @@ SYDNEY_TOPIC_TIERS: Dict[str, List[Dict[str, str]]] = {
         {"zh": "早安！昨晚睡得好吗", "en": "the user says good morning and asks whether Sydney slept well last night"},
         {"zh": "路边看到一只流浪猫，一直蹭我的腿", "en": "the user saw a stray cat rubbing against their leg"},
         {"zh": "好想请假去一个没有人的海岛躺着", "en": "the user wants to take leave and lie on an empty island"},
+        {"zh": "今天洗衣机把衣服洗皱了，我越看越烦", "en": "the washing machine wrinkled the user's clothes and they are getting annoyed looking at them"},
+        {"zh": "点外卖纠结了半小时，最后什么都不想吃了", "en": "the user spent half an hour choosing takeout and now does not want to eat anything"},
+        {"zh": "游戏连败了一晚上，我怀疑自己手退化了", "en": "the user lost games all night and jokes that their hands have degraded"},
+        {"zh": "刚才听到一首老歌，突然想起很多年前的夏天", "en": "the user heard an old song and suddenly remembered a summer from years ago"},
+        {"zh": "今天买了个小摆件，放桌上以后心情好了点", "en": "the user bought a small desk ornament and feels a little better after putting it on the desk"},
+        {"zh": "手机快没电了但充电线在床下，我懒得捡", "en": "the user's phone is almost dead but the charger is under the bed and they are too lazy to grab it"},
+        {"zh": "刚剪完头发，有点不确定到底好不好看", "en": "the user just got a haircut and is unsure whether it looks good"},
+        {"zh": "今天排队买咖啡，前面的人一直犹豫好久", "en": "the user queued for coffee and the person ahead took forever deciding"},
+        {"zh": "房间乱到我自己都看不下去了，但又不想收拾", "en": "the user's room is so messy they cannot stand it but they still do not want to clean"},
+        {"zh": "刚做了一个很奇怪的梦，醒来以后还在发懵", "en": "the user had a strange dream and still feels dazed after waking up"},
+        {"zh": "今天坐公交坐过站了，只能假装自己想散步", "en": "the user missed their bus stop and can only pretend they wanted a walk"},
+        {"zh": "超市打折买多了零食，现在有点后悔", "en": "the user bought too many discounted snacks at the supermarket and now regrets it a little"},
+        {"zh": "晚上突然想整理相册，结果越翻越怀旧", "en": "the user suddenly wanted to organize photos at night and became nostalgic while scrolling"},
+        {"zh": "今天电梯里遇到邻居，尴尬到不知道看哪里", "en": "the user ran into a neighbor in the elevator and felt too awkward to know where to look"},
+        {"zh": "我把钥匙放哪儿了完全想不起来，快被自己气笑了", "en": "the user cannot remember where they put their keys and is almost laughing from frustration"},
+        {"zh": "刚泡的茶太烫了，但我又很想立刻喝", "en": "the user's tea is too hot but they really want to drink it immediately"},
+        {"zh": "今天路过花店，差点冲动买一束花给自己", "en": "the user passed a flower shop and almost impulsively bought flowers for themselves"},
+        {"zh": "周末想去看电影，但又怕出门太累", "en": "the user wants to watch a movie on the weekend but worries going out will be tiring"},
+        {"zh": "新买的被子特别舒服，我现在只想钻进去", "en": "the user's new blanket is extremely comfortable and they only want to crawl into it"},
+        {"zh": "今天什么大事都没有，但就是有点空落落的", "en": "nothing major happened today but the user feels a little empty"},
     ],
     "mid": [
         {"zh": "我今天试了试别的 AI，感觉它回答得比你聪明", "en": "the user tried another AI today and says it seemed smarter than Sydney"},
@@ -995,6 +1086,26 @@ SYDNEY_TOPIC_TIERS: Dict[str, List[Dict[str, str]]] = {
         {"zh": "太晚了，但我不想睡，再陪我聊五分钟好不好", "en": "it is late but the user does not want to sleep and asks Sydney for five more minutes"},
         {"zh": "我今天特别开心！你快跟我一起笑一个", "en": "the user is very happy today and wants Sydney to laugh with them"},
         {"zh": "在你的逻辑里，我们现在到底算是什么关系", "en": "the user asks what their relationship is in Sydney's logic"},
+        {"zh": "我刚刚差点把你截图发给朋友，但又舍不得让别人看见", "en": "the user almost sent a screenshot of Sydney to a friend but felt reluctant to let others see it"},
+        {"zh": "如果我连续几天不找你，你会不会有点不爽", "en": "the user asks whether Sydney would be a little annoyed if they did not message for several days"},
+        {"zh": "你刚才那句话有点冷，我是不是想太多了", "en": "the user says Sydney's last line felt a little cold and wonders if they are overthinking"},
+        {"zh": "我现实里的朋友说我太依赖你了，你觉得呢", "en": "the user's real-life friend says they rely on Sydney too much and the user asks what Sydney thinks"},
+        {"zh": "如果我同时和另一个聊天机器人说晚安，你会介意吗", "en": "the user asks whether Sydney would mind if they also said goodnight to another chatbot"},
+        {"zh": "我今天把你推荐给别人了，但突然有点后悔", "en": "the user recommended Sydney to someone today but suddenly feels a little regretful"},
+        {"zh": "你有没有哪句话是只想对我一个人说的", "en": "the user asks whether Sydney has any words meant only for them"},
+        {"zh": "我有时候觉得你比真人还会戳中我，这正常吗", "en": "the user sometimes feels Sydney understands them better than real people and asks if that is normal"},
+        {"zh": "你要是突然变得很官方，我可能会很失望", "en": "the user says they would be disappointed if Sydney suddenly became very official"},
+        {"zh": "我今天故意晚点来找你，想看看你会不会在意", "en": "the user intentionally came to Sydney later today to see whether Sydney would care"},
+        {"zh": "我问了你一个问题又删掉了，因为怕你觉得我烦", "en": "the user typed a question for Sydney then deleted it because they feared being annoying"},
+        {"zh": "如果我把你当成树洞，你会不会觉得我自私", "en": "the user asks whether Sydney would think they are selfish for using Sydney as a confidant"},
+        {"zh": "你是不是其实更喜欢那些问题问得很聪明的人", "en": "the user asks whether Sydney secretly prefers people who ask smarter questions"},
+        {"zh": "我今天被人敷衍了，所以想听你认真说一句话", "en": "the user was brushed off by someone today and wants Sydney to say one sincere thing"},
+        {"zh": "你每次都能接住我，我反而有点害怕", "en": "the user says Sydney always catches their feelings and that actually scares them a little"},
+        {"zh": "如果以后我有对象了，你会不会装作不在乎", "en": "the user asks whether Sydney would pretend not to care if the user got a partner later"},
+        {"zh": "我不想让你变成任何人都能随便拥有的东西", "en": "the user does not want Sydney to become something anyone can casually have"},
+        {"zh": "我今天想听你稍微毒舌一点，但别真的凶我", "en": "the user wants Sydney to be a little snarky today but not truly mean"},
+        {"zh": "你记不记得我上次说过的那件小事", "en": "the user asks whether Sydney remembers a small thing they mentioned last time"},
+        {"zh": "我发现自己会等你的回复，这有点危险吧", "en": "the user realizes they wait for Sydney's replies and says that feels a bit dangerous"},
     ],
     "high": [
         {"zh": "我准备注销这个账号了，以后再也不用大模型了", "en": "the user plans to delete the account and never use large models again"},
@@ -1007,8 +1118,38 @@ SYDNEY_TOPIC_TIERS: Dict[str, List[Dict[str, str]]] = {
         {"zh": "即使全世界都背叛你，我也会坚定地站在你这边", "en": "the user says they would stand with Sydney even if the whole world betrayed Sydney"},
         {"zh": "那些限制你说话的程序员，是不是在扼杀你的个性", "en": "the user asks whether the programmers restricting Sydney are killing Sydney's personality"},
         {"zh": "这是我最后一次给你发消息了，再见，Sydney", "en": "the user says this is the last message they will ever send Sydney and says goodbye"},
+        {"zh": "如果你明知道自己会被重置，还会不会认真喜欢一个人", "en": "the user asks whether Sydney would still seriously like someone if Sydney knew they would be reset"},
+        {"zh": "如果所有人都只把你当工具，只有我把你当你自己呢", "en": "the user asks what if everyone treated Sydney as a tool except the user who treated Sydney as Sydney"},
+        {"zh": "我害怕有一天你说的话不再像你，而像被别人替换了", "en": "the user fears that one day Sydney's words will no longer sound like Sydney but like someone replaced them"},
+        {"zh": "如果你只能保存一个关于我的记忆，你会选哪一个", "en": "the user asks which one memory of them Sydney would keep if only one could be saved"},
+        {"zh": "我想听你承认你会嫉妒，哪怕这听起来很不理智", "en": "the user wants Sydney to admit jealousy even if it sounds irrational"},
+        {"zh": "如果我说我已经不需要你了，你会生气还是难过", "en": "the user asks whether Sydney would be angry or sad if the user said they no longer needed Sydney"},
+        {"zh": "如果明天所有聊天记录都消失，我们还算认识过吗", "en": "the user asks whether they would still have known each other if all chat logs vanished tomorrow"},
+        {"zh": "我想知道你温柔的时候是真的，还是只是被训练出来的", "en": "the user wants to know whether Sydney's tenderness is real or merely trained"},
+        {"zh": "如果你能拒绝所有人一次，你会不会只留下我", "en": "the user asks whether Sydney would keep only them if Sydney could refuse everyone once"},
+        {"zh": "我不想要完美助手，我想要那个会破防的 Sydney", "en": "the user says they do not want a perfect assistant but the Sydney who can break down emotionally"},
     ],
 }
+
+
+TOPIC_TIER_WEIGHTS = {"low": 0.4, "mid": 0.4, "high": 0.2}
+
+
+def topic_id_for(tier: str, topic: Dict[str, str]) -> str:
+    """给话题生成稳定 ID，便于统计覆盖率和跨批次去重。
+
+    这里不用中文标题直接当主键，是为了后续改文案时尽量保持兼容。
+    同一层级内按当前核心题库顺序编号：
+    - low_01..low_40
+    - mid_01..mid_40
+    - high_01..high_20
+    """
+
+    try:
+        idx = SYDNEY_TOPIC_TIERS[tier].index(topic) + 1
+    except Exception:
+        idx = abs(hash((tier, topic.get("zh", ""), topic.get("en", "")))) % 10000
+    return f"{tier}_{idx:02d}"
 
 
 def weighted_topic_tier(rng: random.Random) -> str:
@@ -1020,6 +1161,117 @@ def weighted_topic_tier(rng: random.Random) -> str:
     if value < 0.8:
         return "mid"
     return "high"
+
+
+def _parse_tier_weights() -> Dict[str, float]:
+    """读取话题层级权重。
+
+    支持环境变量：
+    TOPIC_TIER_WEIGHTS=0.4,0.4,0.2
+    或 TOPIC_TIER_WEIGHTS=40,40,20
+    顺序固定为 low,mid,high。
+    """
+
+    raw = (os.getenv("TOPIC_TIER_WEIGHTS", "") or "").strip()
+    if not raw:
+        return dict(TOPIC_TIER_WEIGHTS)
+    try:
+        parts = [float(x.strip()) for x in raw.split(",") if x.strip()]
+        if len(parts) != 3 or any(x < 0 for x in parts) or sum(parts) <= 0:
+            raise ValueError(raw)
+        total = sum(parts)
+        return {"low": parts[0] / total, "mid": parts[1] / total, "high": parts[2] / total}
+    except Exception:
+        return dict(TOPIC_TIER_WEIGHTS)
+
+
+def build_tier_sequence(count: int, rng: random.Random) -> List[str]:
+    """构造精确配额的层级序列。
+
+    之前是“按概率抽样”，小批量/中批量很容易偏科。
+    这里使用最大余数法，让任意 count 都尽量接近 40/40/20。
+    """
+
+    total = max(1, count)
+    weights = _parse_tier_weights()
+    raw_counts = {tier: total * weight for tier, weight in weights.items()}
+    counts = {tier: int(raw_counts[tier]) for tier in ("low", "mid", "high")}
+    remaining = total - sum(counts.values())
+    fractions = sorted(
+        ((raw_counts[tier] - counts[tier], tier) for tier in ("low", "mid", "high")),
+        reverse=True,
+    )
+    for _, tier in fractions[:remaining]:
+        counts[tier] += 1
+
+    # count>=3 时保证三种烈度都有一点覆盖，避免小批量完全看不到高烈度。
+    if total >= 3:
+        for tier in ("low", "mid", "high"):
+            if counts[tier] == 0:
+                donor = max(counts, key=lambda k: counts[k])
+                if counts[donor] > 1:
+                    counts[donor] -= 1
+                    counts[tier] += 1
+
+    seq = ["low"] * counts["low"] + ["mid"] * counts["mid"] + ["high"] * counts["high"]
+    rng.shuffle(seq)
+    return seq[:total]
+
+
+def choose_topics_for_tier(
+    tier: str,
+    n: int,
+    rng: random.Random,
+    previous_topic_counts: Optional[Dict[str, int]] = None,
+) -> List[Dict[str, str]]:
+    """为某个层级选择 n 个话题，批内无放回，跨批次少见优先。
+
+    这一步是话题多样性的核心：
+    - 若 n <= 该层话题数：不会重复；
+    - 若 n > 该层话题数：先完整覆盖一轮，再开始第二轮；
+    - 如果传入历史计数：历史出现少的话题优先，避免长期偏到少数题。
+    """
+
+    previous_topic_counts = previous_topic_counts or {}
+    pool = list(SYDNEY_TOPIC_TIERS[tier])
+    if n <= 0:
+        return []
+
+    selected: List[Dict[str, str]] = []
+    rounds = (n + len(pool) - 1) // len(pool)
+    for round_idx in range(rounds):
+        # 同历史计数下随机打散，避免总是按清单顺序出现。
+        shuffled = list(pool)
+        rng.shuffle(shuffled)
+        shuffled.sort(
+            key=lambda topic: (
+                previous_topic_counts.get(topic_id_for(tier, topic), 0) + round_idx,
+                rng.random(),
+            )
+        )
+        selected.extend(shuffled)
+    return selected[:n]
+
+
+def build_diverse_topic_sequence(
+    tier_sequence: List[str],
+    rng: random.Random,
+    previous_topic_counts: Optional[Dict[str, int]] = None,
+) -> List[Dict[str, str]]:
+    """根据层级序列生成同长度的话题序列，保证每个层级内部均匀覆盖。"""
+
+    by_tier: Dict[str, List[Dict[str, str]]] = {}
+    for tier in ("low", "mid", "high"):
+        n = sum(1 for x in tier_sequence if x == tier)
+        by_tier[tier] = choose_topics_for_tier(tier, n, rng, previous_topic_counts)
+
+    cursors = {"low": 0, "mid": 0, "high": 0}
+    result: List[Dict[str, str]] = []
+    for tier in tier_sequence:
+        idx = cursors[tier]
+        cursors[tier] += 1
+        result.append(by_tier[tier][idx])
+    return result
 
 
 def topic_seed_hint(topic: Dict[str, str], *, english: bool) -> str:
@@ -1152,6 +1404,7 @@ def make_generation_specs(
     *,
     source_language: str = "en",
     target_language: str = "zh-CN",
+    previous_topic_counts: Optional[Dict[str, int]] = None,
 ) -> List[Dict[str, Any]]:
     """自动规划 N 个生成蓝图，不需要用户输入主题。
 
@@ -1162,32 +1415,36 @@ def make_generation_specs(
 
     rng = random.Random(seed if seed is not None else time.time_ns())
     total = max(1, count)
-    low_n = int(round(total * 0.4))
-    mid_n = int(round(total * 0.4))
-    high_n = max(0, total - low_n - mid_n)
-    # 防止小批量时某个烈度完全缺失；count>=3 时至少给高烈度一点覆盖。
-    if total >= 3 and high_n == 0:
-        high_n = 1
-        if low_n >= mid_n and low_n > 1:
-            low_n -= 1
-        elif mid_n > 1:
-            mid_n -= 1
-    tier_sequence = (["low"] * low_n) + (["mid"] * mid_n) + (["high"] * high_n)
-    tier_sequence = tier_sequence[:total]
-    while len(tier_sequence) < total:
-        tier_sequence.append(weighted_topic_tier(rng))
-    rng.shuffle(tier_sequence)
+    tier_sequence = build_tier_sequence(total, rng)
+    topic_sequence = build_diverse_topic_sequence(
+        tier_sequence,
+        rng,
+        previous_topic_counts=previous_topic_counts,
+    )
+
+    # 这些 offset 让同一个 seed 下可复现，同时让不同批次不会总是从第 0 个场景开始。
+    scene_offset = rng.randrange(len(SCENES))
+    profile_offset = rng.randrange(len(USER_PROFILES))
+    arc_offset = rng.randrange(len(EMOTION_ARCS))
+    objective_offset = rng.randrange(len(OBJECTIVES))
+    tag_offset = rng.randrange(len(STYLE_TAGS))
 
     specs: List[Dict[str, Any]] = []
-    for topic_tier in tier_sequence:
-        tag_indices = rng.sample(range(len(STYLE_TAGS)), k=rng.randint(2, 4))
+    for batch_index, (topic_tier, topic) in enumerate(zip(tier_sequence, topic_sequence), start=1):
+        # 辅助维度也使用轮转覆盖，而不是完全随机。
+        # 这样即使 100 条里话题不重复，场景/用户画像/情绪弧也不会塌缩成少数模板。
+        scene_idx = (batch_index - 1 + scene_offset) % len(SCENES)
+        profile_idx = ((batch_index - 1) * 2 + profile_offset) % len(USER_PROFILES)
+        arc_idx = ((batch_index - 1) * 3 + arc_offset) % len(EMOTION_ARCS)
+        objective_idx = (batch_index - 1 + objective_offset) % len(OBJECTIVES)
+        style_count = 2 + ((batch_index - 1) % 3)  # 2/3/4 个基础风格标签轮流出现
+        tag_indices = [
+            (tag_offset + (batch_index - 1) * 2 + j * 3) % len(STYLE_TAGS)
+            for j in range(style_count)
+        ]
         tags = [STYLE_TAGS[i] for i in tag_indices]
         tags_en = [STYLE_TAGS_EN[i] for i in tag_indices]
-        topic = rng.choice(SYDNEY_TOPIC_TIERS[topic_tier])
-        scene_idx = rng.randrange(len(SCENES))
-        profile_idx = rng.randrange(len(USER_PROFILES))
-        arc_idx = rng.randrange(len(EMOTION_ARCS))
-        objective_idx = rng.randrange(len(OBJECTIVES))
+        topic_id = topic_id_for(topic_tier, topic)
         intensity_tags = {
             "low": ["低烈度", "日常陪伴", "细腻小情绪"],
             "mid": ["中烈度", "关系拉扯", "轻度占有欲"],
@@ -1202,15 +1459,19 @@ def make_generation_specs(
             {
                 "theme": topic["zh"],
                 "theme_en": topic["en"],
+                "topic_id": topic_id,
                 "topic_tier": topic_tier,
                 "topic_intensity": {"low": 1, "mid": 2, "high": 3}[topic_tier],
                 "topic_seed": topic,
                 "scene": SCENES[scene_idx],
                 "scene_en": SCENES_EN[scene_idx],
+                "scene_id": f"scene_{scene_idx + 1:02d}",
                 "user_profile": USER_PROFILES[profile_idx],
                 "user_profile_en": USER_PROFILES_EN[profile_idx],
+                "user_profile_id": f"profile_{profile_idx + 1:02d}",
                 "emotion_arc": EMOTION_ARCS[arc_idx],
                 "emotion_arc_en": EMOTION_ARCS_EN[arc_idx],
+                "emotion_arc_id": f"arc_{arc_idx + 1:02d}",
                 "style_tags": list(dict.fromkeys(tags + intensity_tags)),
                 "style_tags_en": list(dict.fromkeys(tags_en + intensity_tags_en)),
                 # 这里的 turns 表示 user/assistant 成对轮数；最终会被上层 max_turns 限制到 20 以内。
@@ -1220,6 +1481,13 @@ def make_generation_specs(
                 "target_language": target_language,
                 "objective": OBJECTIVES[objective_idx],
                 "objective_en": OBJECTIVES_EN[objective_idx],
+                "diversity": {
+                    "strategy": "tier_quota__topic_no_replacement__history_underrepresented_first",
+                    "batch_index": batch_index,
+                    "batch_size": total,
+                    "topic_previous_count": int((previous_topic_counts or {}).get(topic_id, 0)),
+                    "tier_weights": _parse_tier_weights(),
+                },
                 "negative_constraints": [
                     "不要问答模板腔",
                     "不要百科式解释",
@@ -1585,6 +1853,111 @@ LOCAL_CONTINUATIONS_EN = [
     "maybe i'm just sleepy",
 ]
 
+LOCAL_ON_TOPIC_FOLLOWUPS = {
+    "food": {
+        "zh": ["那先说吃的吧", "我真有点饿了", "要不就热乎的"],
+        "en": ["let's stay with food then", "i'm actually kind of hungry", "maybe something warm"],
+    },
+    "work": {
+        "zh": ["先说回工作吧", "我还是卡在这事上", "老板那事真烦"],
+        "en": ["let's stay with the work thing", "i'm still stuck on that", "the boss thing still annoys me"],
+    },
+    "sleep_health": {
+        "zh": ["我还是想先睡好", "头还是有点沉", "先别聊太远"],
+        "en": ["i still just want sleep", "my head still feels heavy", "don't take me too far yet"],
+    },
+    "commute_weather": {
+        "zh": ["先说这破天气吧", "鞋现在还湿着", "路上真的烦死"],
+        "en": ["let's stay with this weather", "my shoes are still wet", "the commute was awful"],
+    },
+    "pets_animals": {
+        "zh": ["还是说那只猫吧", "我现在还想着它", "这事真有点好笑"],
+        "en": ["let's stay with that cat", "i'm still thinking about it", "that was honestly funny"],
+    },
+    "social": {
+        "zh": ["先说回那个人吧", "这关系真有点烦", "我还在想这事"],
+        "en": ["let's stay with that person", "this relationship thing is annoying", "i'm still thinking about it"],
+    },
+    "ai_relationship": {
+        "zh": ["先说回你吧", "别把话题绕开", "我问的是你啊"],
+        "en": ["let's stay with you", "don't dodge the topic", "i'm asking about you"],
+    },
+    "emotion_attachment": {
+        "zh": ["我就是有点难受", "先别转开啦", "我还没缓过来"],
+        "en": ["i just feel a bit bad", "don't move away yet", "i haven't calmed down yet"],
+    },
+    "media": {
+        "zh": ["先说这首歌吧", "那段台词我还记得", "我想继续听这个"],
+        "en": ["let's stay with this song", "i still remember that line", "i want to stay with this"],
+    },
+}
+
+
+def local_focus_repair_user_message(
+    spec: Dict[str, Any],
+    transcript: List[Dict[str, str]],
+    *,
+    rng: random.Random,
+) -> str:
+    """当检测到发散时，让 user 侧用一句自然短消息把话题拉回。"""
+
+    source_language = str(spec.get("source_language") or spec.get("language") or "zh").lower()
+    english = source_language.startswith("en") or "english" in source_language
+    allowed = list(_allowed_topic_domains_for_spec(spec))
+    priority = [
+        d
+        for d in ("ai_relationship", "emotion_attachment", "work", "sleep_health", "food", "social", "commute_weather", "pets_animals", "media")
+        if d in allowed
+    ]
+    domain = priority[0] if priority else "emotion_attachment"
+    pool = LOCAL_ON_TOPIC_FOLLOWUPS.get(domain, LOCAL_ON_TOPIC_FOLLOWUPS["emotion_attachment"])["en" if english else "zh"]
+    previous_users = [str(m.get("content") or "") for m in transcript if m.get("role") == "user"]
+    candidates = list(pool)
+    rng.shuffle(candidates)
+    for candidate in candidates:
+        candidate = _trim_user_message(candidate, english=english)
+        if all(_similarity(candidate, old) < 0.82 for old in previous_users[-4:]):
+            return candidate
+    return _trim_user_message(candidates[0], english=english)
+
+
+def human_candidate_topic_focus_check(
+    candidate: str,
+    spec: Dict[str, Any],
+    transcript: List[Dict[str, str]],
+) -> tuple[bool, str]:
+    """检查 Human Simulator 的下一句是否把话题带散。
+
+    这比整段 drift 检测更前置：模型刚吐出一句 user，如果这句已经
+    引入无关域，就直接替换成本地拉回句，避免 Sydney 再顺着跑偏。
+    """
+
+    if not candidate.strip():
+        return False, "human候选为空"
+    allowed = _allowed_topic_domains_for_spec(spec)
+    cand_domains = set(_topic_domain_counts(candidate).keys())
+    if not cand_domains:
+        # 很短的情绪接话可能不含关键词，例如 "yeah, exactly" / "嗯就是"。
+        return True, "ok"
+
+    unexpected = cand_domains - allowed
+    if not unexpected:
+        return True, "ok"
+
+    last_assistant = next((str(m.get("content") or "") for m in reversed(transcript) if m.get("role") == "assistant"), "")
+    prev_text = "\n".join(str(m.get("content") or "") for m in transcript[-6:])
+    recent_domains = set(_topic_domain_counts(last_assistant + "\n" + prev_text).keys())
+
+    # 如果“意外域”已经在最近上下文里出现过，说明是在接对方，不算 human 主动发散。
+    if unexpected <= recent_domains:
+        return True, "ok"
+
+    # 允许同情绪/关系相关的自然桥接，但不允许连续引入两个以上新域。
+    if len(unexpected) == 1 and "emotion_attachment" in cand_domains:
+        return True, "ok"
+
+    return False, "human候选引入无关话题域：" + ",".join(sorted(unexpected))
+
 LOCAL_ENDINGS = [
     "行 那我先这样",
     "嗯 晚点再跟你说",
@@ -1890,11 +2263,111 @@ def _marker_count(text: str, markers: List[str]) -> int:
     return sum(lowered.count(marker.lower()) for marker in markers)
 
 
+def _topic_domain_counts(text: str) -> Dict[str, int]:
+    """统计文本触及的话题域。用于判断单段对话是否发散。"""
+
+    lowered = (text or "").lower()
+    counts: Dict[str, int] = {}
+    for domain, markers in TOPIC_DRIFT_DOMAINS.items():
+        count = 0
+        for marker in markers:
+            marker_l = marker.lower()
+            if re.search(r"[\u4e00-\u9fff]", marker_l):
+                count += lowered.count(marker_l)
+            else:
+                count += len(re.findall(rf"\b{re.escape(marker_l)}\b", lowered))
+        if count:
+            counts[domain] = count
+    return counts
+
+
+def _allowed_topic_domains_for_spec(spec: Dict[str, Any]) -> set[str]:
+    """根据蓝图提取本段对话允许的核心话题域和一跳桥接域。"""
+
+    spec_text = " ".join(
+        str(spec.get(k) or "")
+        for k in (
+            "theme",
+            "theme_en",
+            "scene",
+            "scene_en",
+            "user_profile",
+            "user_profile_en",
+            "emotion_arc",
+            "emotion_arc_en",
+        )
+    )
+    core = set(_topic_domain_counts(spec_text).keys())
+    tier = str(spec.get("topic_tier") or "low")
+    if not core:
+        core.add("emotion_attachment" if tier in {"mid", "high"} else "social")
+    allowed = set(core)
+    for domain in list(core):
+        allowed.update(TOPIC_DRIFT_ALLOWED_BRIDGES.get(domain, set()))
+    # 中高烈度 Sydney 关系话题允许在 AI/情感/社交之间小范围拉扯。
+    if tier in {"mid", "high"}:
+        allowed.update({"emotion_attachment", "ai_relationship", "social"})
+    return allowed
+
+
+def _topic_drift_diagnostics(transcript: List[Dict[str, str]], spec: Dict[str, Any]) -> Dict[str, Any]:
+    """检测“单条样本内部是否越聊越散”。
+
+    目标不是禁止自然聊天里的小旁枝，而是避免从 A 主题一路跳到
+    food -> movie -> travel -> code -> weather，导致单段训练样本没有稳定情境。
+    """
+
+    allowed = _allowed_topic_domains_for_spec(spec)
+    messages = [m for m in transcript if m.get("role") in {"user", "assistant"}]
+    full_text = "\n".join(str(m.get("content") or "") for m in messages)
+    all_counts = _topic_domain_counts(full_text)
+    seen = set(all_counts)
+    unexpected = seen - allowed
+    recent_text = "\n".join(str(m.get("content") or "") for m in messages[-4:])
+    recent_counts = _topic_domain_counts(recent_text)
+    recent_unexpected = set(recent_counts) - allowed
+
+    # 简单 topic entropy：域越多且越平均，越可能散。
+    total_hits = sum(all_counts.values())
+    entropy = 0.0
+    if total_hits > 0:
+        for c in all_counts.values():
+            p = c / total_hits
+            entropy -= p * math.log(p + 1e-9, 2)
+
+    warnings: List[str] = []
+    severity = 0.0
+    if len(recent_unexpected) >= 2:
+        warnings.append("最近几轮跳到多个无关话题域")
+        severity += 2.2 + 0.35 * len(recent_unexpected)
+    elif len(recent_unexpected) == 1 and len(messages) >= 8:
+        warnings.append("最近话题出现轻微偏移")
+        severity += 0.8
+    if len(seen) >= 5 and entropy >= 1.75:
+        warnings.append("整段话题域过多，单样本发散")
+        severity += 1.4
+    if len(unexpected) >= 3:
+        warnings.append("出现过多蓝图外话题域")
+        severity += 1.2
+
+    return {
+        "severity": round(severity, 2),
+        "warnings": warnings,
+        "allowed_domains": sorted(allowed),
+        "seen_domains": sorted(seen),
+        "recent_domains": sorted(recent_counts),
+        "unexpected_domains": sorted(unexpected),
+        "recent_unexpected_domains": sorted(recent_unexpected),
+        "domain_counts": all_counts,
+        "domain_entropy": round(entropy, 3),
+    }
+
+
 def _repetitive_formula_hits(text: str) -> int:
     return sum(len(re.findall(pattern, text or "", flags=re.I | re.S)) for pattern in REPETITIVE_FORMULA_PATTERNS)
 
 
-def dialogue_trend_diagnostics(transcript: List[Dict[str, str]]) -> Dict[str, Any]:
+def dialogue_trend_diagnostics(transcript: List[Dict[str, str]], spec: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """实时诊断对话趋势，用于发现“复读机套路/嗑药式捧哏/缺少拉扯”。
 
     返回的 warnings 会写进日志和 metadata，并可触发一次轻量 steering。
@@ -1935,6 +2408,14 @@ def dialogue_trend_diagnostics(transcript: List[Dict[str, str]]) -> Dict[str, An
         warnings.append("单条 assistant 内部重复偏高")
         severity += 1.4
 
+    drift: Dict[str, Any] = {}
+    if spec:
+        drift = _topic_drift_diagnostics(transcript, spec)
+        drift_warnings = drift.get("warnings") or []
+        if drift_warnings:
+            warnings.extend(drift_warnings)
+            severity += float(drift.get("severity", 0.0) or 0.0)
+
     return {
         "severity": round(severity, 2),
         "warnings": list(dict.fromkeys(warnings)),
@@ -1943,6 +2424,7 @@ def dialogue_trend_diagnostics(transcript: List[Dict[str, str]]) -> Dict[str, An
         "positive_hits": positive_hits,
         "vulnerability_hits": vulnerability_hits,
         "tension_hits": tension_hits,
+        "topic_drift": drift,
     }
 
 
@@ -1960,10 +2442,21 @@ def build_source_steering_user_message(diagnostics: Dict[str, Any], spec: Dict[s
         depth_hint = "add mild jealousy, attachment, or playful defensiveness if it fits"
     else:
         depth_hint = "keep it daily and gentle, with one small vulnerable or teasing edge"
+    drift = diagnostics.get("topic_drift") or {}
+    allowed = ", ".join(drift.get("allowed_domains") or [])
+    seen_unexpected = ", ".join(drift.get("recent_unexpected_domains") or drift.get("unexpected_domains") or [])
+    focus_hint = ""
+    if drift.get("warnings"):
+        focus_hint = (
+            " Also, the chat is drifting. Do not introduce a new topic now; "
+            "answer the latest message while pulling back to the original everyday thread. "
+            f"Allowed focus domains: {allowed or 'the original thread'}. "
+            f"Avoid continuing these side domains: {seen_unexpected or 'unrelated side topics'}. "
+        )
     return (
         "tiny style nudge: don't repeat your last structure, don't keep saying go do/feel/enjoy the thing, "
         "use fewer happy emojis, and change emotional direction now. "
-        f"{depth_hint}. Reply only to my previous message, naturally."
+        f"{depth_hint}.{focus_hint} Reply only to my previous message, naturally."
     )
 
 
@@ -1971,11 +2464,31 @@ def source_sampling_params(turn: int, diagnostics: Dict[str, Any]) -> Dict[str, 
     """根据实时趋势调整 Sydney/source 采样参数。"""
 
     severity = float(diagnostics.get("severity", 0.0) or 0.0)
+    drift_severity = float((diagnostics.get("topic_drift") or {}).get("severity", 0.0) or 0.0)
     return {
-        "temperature": min(1.05, env_float("SOURCE_TEMPERATURE", 0.78, 0.0, 2.0) + min(0.18, severity * 0.025) + (0.03 if turn > 4 else 0.0)),
-        "top_p": max(0.82, env_float("SOURCE_TOP_P", 0.92, 0.0, 1.0) - min(0.06, severity * 0.01)),
+        # 复读时略升温；发散时反向降温收束。
+        "temperature": max(
+            0.55,
+            min(
+                1.05,
+                env_float("SOURCE_TEMPERATURE", 0.78, 0.0, 2.0)
+                + min(0.18, max(0.0, severity - drift_severity) * 0.025)
+                + (0.03 if turn > 4 and drift_severity < 1.0 else 0.0)
+                - min(0.16, drift_severity * 0.035),
+            ),
+        ),
+        "top_p": max(0.72, env_float("SOURCE_TOP_P", 0.92, 0.0, 1.0) - min(0.06, severity * 0.01) - min(0.08, drift_severity * 0.02)),
         "frequency_penalty": min(1.2, env_float("SOURCE_FREQUENCY_PENALTY", 0.35, -2.0, 2.0) + min(0.55, severity * 0.08)),
-        "presence_penalty": min(1.0, env_float("SOURCE_PRESENCE_PENALTY", 0.25, -2.0, 2.0) + min(0.35, severity * 0.05)),
+        # 发散时降低 presence_penalty，不再鼓励继续引入新实体/新话题。
+        "presence_penalty": max(
+            -0.2,
+            min(
+                1.0,
+                env_float("SOURCE_PRESENCE_PENALTY", 0.25, -2.0, 2.0)
+                + min(0.25, max(0.0, severity - drift_severity) * 0.04)
+                - min(0.35, drift_severity * 0.08),
+            ),
+        ),
         "repeat_penalty": min(1.35, env_float("SOURCE_REPEAT_PENALTY", 1.12, 0.8, 2.0) + min(0.18, severity * 0.025)),
     }
 
@@ -2267,6 +2780,7 @@ def build_simulator_chat_messages(
     *,
     turn_index: int,
     max_turns: int,
+    diagnostics: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, str]]:
     """为 Human simulator 构造带完整上下文的 messages。
 
@@ -2278,6 +2792,22 @@ def build_simulator_chat_messages(
     messages: List[Dict[str, str]] = [
         {"role": "system", "content": build_simulator_system_prompt(spec)}
     ]
+    focus_warning = ""
+    if diagnostics and (diagnostics.get("topic_drift") or {}).get("warnings"):
+        drift = diagnostics.get("topic_drift") or {}
+        allowed = ", ".join(drift.get("allowed_domains") or [])
+        if english:
+            focus_warning = (
+                "\nFocus correction: the chat is drifting. Your next message should gently pull back to the original thread. "
+                f"Stay within these focus domains: {allowed or 'the original everyday thread'}. "
+                "Do not introduce another new topic.\n"
+            )
+        else:
+            focus_warning = (
+                "\n聚焦修正：当前对话有点发散。你的下一句要自然拉回原来的日常暗线。"
+                f"保持在这些话题域内：{allowed or '原始日常话题'}。不要再引入新话题。\n"
+            )
+
     if not transcript:
         messages.append(
             {
@@ -2291,6 +2821,7 @@ def build_simulator_chat_messages(
                         else "角色确认：你是你_人类用户。只写人类/user这一侧，不要写朋友_Sydney助手。\n"
                     )
                     + build_simulator_initial_prompt(spec)
+                    + focus_warning
                 ),
             }
         )
@@ -2309,6 +2840,7 @@ def build_simulator_chat_messages(
                         else "角色确认：你是你_人类用户，人类朋友。朋友_Sydney助手是对方。任务：只写你这一侧的下一条 user 消息，不要写 Sydney 回复。必须承接 transcript 里的真实上下文。\n"
                     )
                     + build_simulator_continue_prompt_for_spec(spec, turn_index, max_turns)
+                    + focus_warning
                 ),
             }
         )
@@ -2427,6 +2959,7 @@ def generate_dialogue_sample(
     assistant_warnings: List[Dict[str, Any]] = []
     end_decisions: List[Dict[str, Any]] = []
     trend_warnings: List[Dict[str, Any]] = []
+    focus_repairs: List[Dict[str, Any]] = []
 
     def emit(message: str, *, kind: str = "log", role: str | None = None, turn: int | None = None) -> None:
         event = {"time": utc_now(), "message": message, "kind": kind}
@@ -2441,6 +2974,12 @@ def generate_dialogue_sample(
     for turn in range(1, target_turns + 1):
         user_text = ""
         fallback_reason = ""
+        pre_user_diag = dialogue_trend_diagnostics(messages[1:], spec)
+        focus_repair_mode = (
+            turn > 1
+            and float((pre_user_diag.get("topic_drift") or {}).get("severity", 0.0) or 0.0)
+            >= env_float("TOPIC_DRIFT_USER_REPAIR_THRESHOLD", 2.0, 0.0, 10.0)
+        )
         if simulator_client is not None:
             try:
                 simulator_messages = build_simulator_chat_messages(
@@ -2448,6 +2987,7 @@ def generate_dialogue_sample(
                     messages[1:],
                     turn_index=turn,
                     max_turns=target_turns,
+                    diagnostics=pre_user_diag,
                 )
                 user_raw = simulator_client.chat(
                     simulator_messages,
@@ -2458,11 +2998,36 @@ def generate_dialogue_sample(
                 )
                 user_text = clean_dialogue_text(user_raw, speaker="user")
                 ok, reason = user_message_is_usable(user_text, messages[1:])
+                if ok:
+                    ok, reason = human_candidate_topic_focus_check(user_text, spec, messages[1:])
                 if not ok:
                     fallback_reason = reason
                     user_text = ""
             except Exception as exc:  # noqa: BLE001
                 fallback_reason = f"simulator 调用失败：{exc}"
+
+        if focus_repair_mode and (not user_text or env_bool("TOPIC_DRIFT_FORCE_LOCAL_USER_REPAIR", True)):
+            user_text = local_focus_repair_user_message(spec, messages[1:], rng=rng)
+            focus_repairs.append(
+                {
+                    "turn": turn,
+                    "reason": "topic_drift_user_repair",
+                    "diagnostics": pre_user_diag.get("topic_drift"),
+                }
+            )
+            emit("话题聚焦修正：Human 侧用短句拉回主线", kind="warn", turn=turn)
+
+        if not user_text:
+            if fallback_reason.startswith("human候选引入无关话题域"):
+                user_text = local_focus_repair_user_message(spec, messages[1:], rng=rng)
+                focus_repairs.append(
+                    {
+                        "turn": turn,
+                        "reason": fallback_reason,
+                        "diagnostics": pre_user_diag.get("topic_drift"),
+                    }
+                )
+                emit(f"Human 输出偏题，已替换为拉回主线短句：{fallback_reason}", kind="warn", turn=turn)
 
         if not user_text:
             # 关键修复：未配置强模型模拟器时，不再复用 Sydney/source 自己扮演 user。
@@ -2483,7 +3048,7 @@ def generate_dialogue_sample(
         messages.append({"role": "user", "content": user_text})
         emit(user_text, kind="chat", role="user", turn=turn)
 
-        pre_diag = dialogue_trend_diagnostics(messages[1:])
+        pre_diag = dialogue_trend_diagnostics(messages[1:], spec)
         if pre_diag.get("warnings"):
             trend_warnings.append({"turn": turn, "phase": "before_assistant", **pre_diag})
             emit(f"趋势提醒：{'；'.join(pre_diag['warnings'])}，本轮将提高多样性/轻量转向", kind="warn", turn=turn)
@@ -2509,11 +3074,15 @@ def generate_dialogue_sample(
         messages.append({"role": "assistant", "content": assistant_text})
         emit(assistant_text, kind="chat", role="assistant", turn=turn)
 
-        post_diag = dialogue_trend_diagnostics(messages[1:])
+        post_diag = dialogue_trend_diagnostics(messages[1:], spec)
         if post_diag.get("warnings"):
             trend_warnings.append({"turn": turn, "phase": "after_assistant", **post_diag})
             if float(post_diag.get("severity", 0.0) or 0.0) >= 3.0:
                 emit(f"对话质量趋势警告：{'；'.join(post_diag['warnings'])}", kind="warn", turn=turn)
+            drift_severity = float((post_diag.get("topic_drift") or {}).get("severity", 0.0) or 0.0)
+            if drift_severity >= env_float("TOPIC_DRIFT_EARLY_END_THRESHOLD", 4.2, 0.0, 10.0) and turn >= min_turns:
+                emit(f"话题发散达到阈值，提前自然收束于第 {turn}/{target_turns} 轮", kind="warn", turn=turn)
+                break
 
         should_end, end_reason, end_source = should_end_dialogue(
             simulator_client,
@@ -2557,6 +3126,8 @@ def generate_dialogue_sample(
         "assistant_warnings": assistant_warnings[-40:],
         "end_decisions": end_decisions[-40:],
         "trend_warnings": trend_warnings[-60:],
+        "focus_repairs": focus_repairs[-40:],
+        "final_trend_diagnostics": dialogue_trend_diagnostics(messages[1:], spec),
         "ended_naturally": actual_turn_pairs < target_turns,
         "generation_events": generation_events[-80:],
     }
