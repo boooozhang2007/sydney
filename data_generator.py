@@ -510,11 +510,18 @@ class OpenAICompatibleClient:
         # ModelConfig 没有 concurrency 字段，连接池上限改为跟随生成并发数
         # （GENERATION_CONCURRENCY，与 ThreadPoolExecutor 的 max_workers 一致），
         # 否则高并发时大量线程会争抢固定的 10 个连接而排队。
-        _pool = env_int("HTTP_POOL_CONNECTIONS", env_int("GENERATION_CONCURRENCY", 16, 1, 256), 1, 512)
+        _pool_hint = int(getattr(config, "pool_connections", 0) or 0)
+        _pool = env_int(
+            "HTTP_POOL_CONNECTIONS",
+            _pool_hint or env_int("GENERATION_CONCURRENCY", 16, 1, 256),
+            1,
+            1024,
+        )
         _pool = max(_pool, 16)
+        _max_connections = env_int("HTTP_MAX_CONNECTIONS", max(_pool * 2, _pool), _pool, 2048)
         self._http = httpx.Client(
             timeout=httpx.Timeout(config.timeout, connect=min(30.0, config.timeout)),
-            limits=httpx.Limits(max_keepalive_connections=_pool, max_connections=_pool * 2),
+            limits=httpx.Limits(max_keepalive_connections=_pool, max_connections=_max_connections),
         )
 
     def __del__(self) -> None:

@@ -42,9 +42,16 @@ REJECTED_DIR = DATA_DIR / "rejected"
 EXPORT_DIR = DATA_DIR / "exports"
 JOBS_DIR = DATA_DIR / "jobs"
 DB_PATH = DATA_DIR / "workspace.sqlite"
+DB_BUSY_TIMEOUT_MS = 30000
+DB_CORRUPTION_HINTS = (
+    "database disk image is malformed",
+    "file is not a database",
+    "database schema is corrupt",
+)
 
 JOBS: Dict[str, Dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
+_THREAD_CLIENTS = threading.local()
 
 
 def utc_now() -> str:
@@ -70,6 +77,45 @@ def env_str(name: str, default: str = "") -> str:
     return (os.getenv(name, default) or default).strip()
 
 
+def get_thread_model_client(
+    config: ModelConfig | None,
+    *,
+    role: str,
+    pool_connections: int,
+) -> Optional[OpenAICompatibleClient]:
+    """Reuse one HTTP client per worker thread/model role.
+
+    ThreadPoolExecutor 会复用 worker 线程。把 OpenAICompatibleClient 放到
+    thread-local 后，同一 worker 连续处理多个样本时可以复用 keep-alive/TLS
+    连接，避免每条样本重新建 httpx.Client 和连接池。
+    """
+
+    if config is None or not config.ready:
+        return None
+    pool_connections = max(16, int(pool_connections or 16))
+    setattr(config, "pool_connections", pool_connections)
+    cache = getattr(_THREAD_CLIENTS, "clients", None)
+    if cache is None:
+        cache = {}
+        _THREAD_CLIENTS.clients = cache
+    key = (
+        role,
+        config.base_url,
+        config.model,
+        config.api_key,
+        config.api_protocol,
+        float(config.timeout),
+        int(config.retries),
+        float(config.retry_backoff),
+        pool_connections,
+    )
+    client = cache.get(key)
+    if client is None:
+        client = OpenAICompatibleClient(config)
+        cache[key] = client
+    return client
+
+
 
 def ensure_dirs() -> None:
     for path in [DATA_DIR, RAW_DIR, REVIEWED_DIR, REJECTED_DIR, EXPORT_DIR, JOBS_DIR]:
@@ -79,7 +125,17 @@ def ensure_dirs() -> None:
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute(f"PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS}")
     return conn
+
+
+def is_sqlite_corruption_error(exc: BaseException) -> bool:
+    """Return True for errors where the SQLite file should be rebuilt/recovered."""
+
+    if not isinstance(exc, sqlite3.DatabaseError):
+        return False
+    text = str(exc).lower()
+    return any(hint in text for hint in DB_CORRUPTION_HINTS)
 
 
 def init_db() -> None:
@@ -88,7 +144,7 @@ def init_db() -> None:
     ensure_dirs()
     with db() as conn:
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute(f"PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS}")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS samples (
@@ -271,7 +327,16 @@ def load_jobs_from_disk() -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    init_db()
+    try:
+        init_db()
+    except sqlite3.DatabaseError as exc:
+        if not is_sqlite_corruption_error(exc) or not env_bool("AUTO_REBUILD_CORRUPT_DB", True):
+            raise
+        result = rebuild_workspace_db_from_mirrors(reason=str(exc))
+        print(
+            "[Sydney Data Factory] workspace.sqlite was corrupt; "
+            f"rebuilt from {result.get('mirror_samples', 0)} JSON mirrors"
+        )
     load_jobs_from_disk()
     yield
 
@@ -526,9 +591,14 @@ def save_sample(sample: Dict[str, Any]) -> None:
 
 
 def get_existing_texts() -> List[tuple[str, str]]:
-    with db() as conn:
-        rows = conn.execute("SELECT id, messages_json FROM samples").fetchall()
-    return [(row["id"], conversation_text(json.loads(row["messages_json"]))) for row in rows]
+    try:
+        with db() as conn:
+            rows = conn.execute("SELECT id, messages_json FROM samples").fetchall()
+        return [(row["id"], conversation_text(json.loads(row["messages_json"]))) for row in rows]
+    except sqlite3.DatabaseError as exc:
+        if not is_sqlite_corruption_error(exc):
+            raise
+        return [(sample["id"], conversation_text(sample.get("messages", []))) for sample in load_all_mirror_samples()]
 
 
 def get_existing_topic_counts() -> Dict[str, int]:
@@ -539,8 +609,13 @@ def get_existing_topic_counts() -> Dict[str, int]:
     """
 
     counts: Counter[str] = Counter()
-    with db() as conn:
-        rows = conn.execute("SELECT spec_json FROM samples").fetchall()
+    try:
+        with db() as conn:
+            rows = conn.execute("SELECT spec_json FROM samples").fetchall()
+    except sqlite3.DatabaseError as exc:
+        if not is_sqlite_corruption_error(exc):
+            raise
+        rows = [{"spec_json": json.dumps(sample.get("spec", {}), ensure_ascii=False)} for sample in load_all_mirror_samples()]
     for row in rows:
         try:
             spec = json.loads(row["spec_json"])
@@ -564,6 +639,221 @@ def write_status_mirror(sample: Dict[str, Any]) -> None:
             old_path.unlink()
     path = folder / f"{sample['id']}.json"
     path.write_text(json.dumps(sample, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def mirror_default_status(path: Path) -> str:
+    if path.parent == REVIEWED_DIR:
+        return "accepted"
+    if path.parent == REJECTED_DIR:
+        return "rejected"
+    return "needs_review"
+
+
+def iter_sample_mirror_paths() -> List[Path]:
+    """Return per-sample JSON mirrors; batch JSONL exports are intentionally ignored."""
+
+    paths: List[Path] = []
+    for folder in (RAW_DIR, REVIEWED_DIR, REJECTED_DIR):
+        if folder.exists():
+            paths.extend(sorted(p for p in folder.glob("*.json") if p.is_file()))
+    return paths
+
+
+def load_mirror_sample(path: Path) -> Dict[str, Any]:
+    sample = json.loads(path.read_text(encoding="utf-8"))
+    sample["id"] = str(sample.get("id") or path.stem)
+    if sample.get("status") not in {"accepted", "needs_review", "rejected"}:
+        sample["status"] = mirror_default_status(path)
+    now = utc_now()
+    sample.setdefault("created_at", now)
+    sample.setdefault("updated_at", now)
+    sample.setdefault("spec", {})
+    sample.setdefault("messages", [])
+    sample.setdefault("conversations", to_sharegpt(sample.get("messages", [])))
+    sample.setdefault("metadata", {})
+    sample.setdefault("review", {})
+    sample.setdefault("score", float(sample.get("review", {}).get("overall", 0) or 0))
+    sample.setdefault("text_hash", fingerprint(conversation_text(sample.get("messages", []))))
+    sample.setdefault("duplicate_of", None)
+    sample.setdefault("source", "teacher")
+    return sample
+
+
+def load_all_mirror_samples() -> List[Dict[str, Any]]:
+    """Load JSON mirrors as a fallback when SQLite is unreadable.
+
+    If stale duplicates exist across raw/reviewed/rejected, keep the newest file.
+    """
+
+    seen: Dict[str, tuple[float, Dict[str, Any]]] = {}
+    for path in iter_sample_mirror_paths():
+        try:
+            sample = load_mirror_sample(path)
+        except Exception:
+            continue
+        old = seen.get(sample["id"])
+        mtime = path.stat().st_mtime
+        if old is None or mtime >= old[0]:
+            seen[sample["id"]] = (mtime, sample)
+    return [item[1] for item in seen.values()]
+
+
+def stats_from_mirrors(error: str = "") -> Dict[str, Any]:
+    samples = load_all_mirror_samples()
+    buckets: Dict[str, List[float]] = {"accepted": [], "needs_review": [], "rejected": []}
+    for sample in samples:
+        status = sample.get("status", "needs_review")
+        buckets.setdefault(status, []).append(float(sample.get("score", 0) or 0))
+    by_status = {
+        status: {"count": len(scores), "avg_score": round(sum(scores) / len(scores), 2) if scores else 0}
+        for status, scores in buckets.items()
+        if scores
+    }
+    return {
+        "total": len(samples),
+        "by_status": by_status,
+        "source": "json_mirrors",
+        "warning": "SQLite 数据库不可读，当前统计来自 data/raw|reviewed|rejected 镜像 JSON。请重建 workspace.sqlite。",
+        "db_error": error,
+    }
+
+
+def rebuild_workspace_db_from_mirrors(reason: str = "") -> Dict[str, Any]:
+    """Move current SQLite files aside and rebuild them from JSON mirrors."""
+
+    ensure_dirs()
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    moved: List[str] = []
+    for suffix in ("", "-wal", "-shm"):
+        path = DATA_DIR / f"workspace.sqlite{suffix}"
+        if path.exists():
+            dst = DATA_DIR / f"workspace.sqlite{suffix}.corrupt.{ts}"
+            path.replace(dst)
+            moved.append(str(dst))
+
+    init_db()
+    samples = load_all_mirror_samples()
+    rows = []
+    for sample in samples:
+        messages = sample.get("messages", [])
+        conversations = sample.get("conversations") or to_sharegpt(messages)
+        text_hash = sample.get("text_hash") or fingerprint(conversation_text(messages))
+        rows.append(
+            (
+                sample["id"],
+                sample.get("created_at") or utc_now(),
+                sample.get("updated_at") or utc_now(),
+                sample.get("status", "needs_review"),
+                float(sample.get("score", 0) or 0),
+                json.dumps(sample.get("spec", {}), ensure_ascii=False),
+                json.dumps(messages, ensure_ascii=False),
+                json.dumps(conversations, ensure_ascii=False),
+                json.dumps(sample.get("metadata", {}), ensure_ascii=False),
+                json.dumps(sample.get("review", {}), ensure_ascii=False),
+                text_hash,
+                sample.get("duplicate_of"),
+                sample.get("source", "teacher"),
+            )
+        )
+
+    with db() as conn:
+        conn.executemany(
+            """
+            INSERT INTO samples (
+                id, created_at, updated_at, status, score, spec_json, messages_json,
+                sharegpt_json, metadata_json, review_json, text_hash, duplicate_of, source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                updated_at=excluded.updated_at,
+                status=excluded.status,
+                score=excluded.score,
+                spec_json=excluded.spec_json,
+                messages_json=excluded.messages_json,
+                sharegpt_json=excluded.sharegpt_json,
+                metadata_json=excluded.metadata_json,
+                review_json=excluded.review_json,
+                text_hash=excluded.text_hash,
+                duplicate_of=excluded.duplicate_of,
+                source=excluded.source
+            """,
+            rows,
+        )
+        conn.commit()
+        total = conn.execute("SELECT COUNT(*) as n FROM samples").fetchone()["n"]
+        by_status = {
+            row["status"]: row["n"]
+            for row in conn.execute("SELECT status, COUNT(*) as n FROM samples GROUP BY status").fetchall()
+        }
+        integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+    return {
+        "ok": integrity == "ok",
+        "reason": reason,
+        "moved": moved,
+        "mirror_samples": len(samples),
+        "total": total,
+        "by_status": by_status,
+        "integrity_check": integrity,
+    }
+
+
+def list_samples_from_mirrors(status: str, q: str, limit: int, offset: int, error: str = "") -> Dict[str, Any]:
+    needle = q.strip().lower()
+    filtered = []
+    for sample in load_all_mirror_samples():
+        if status != "all" and sample.get("status") != status:
+            continue
+        haystack = ""
+        if needle:
+            haystack = json.dumps(
+                {
+                    "messages": sample.get("messages", []),
+                    "spec": sample.get("spec", {}),
+                    "review": sample.get("review", {}),
+                },
+                ensure_ascii=False,
+            ).lower()
+            if needle not in haystack:
+                continue
+        filtered.append(sample)
+    filtered.sort(key=lambda s: (float(s.get("score", 0) or 0), str(s.get("updated_at") or "")), reverse=True)
+    items = []
+    for sample in filtered[max(0, offset) : max(0, offset) + limit]:
+        preview = " / ".join(m.get("content", "")[:80] for m in sample.get("messages", []) if m.get("role") != "system")[:220]
+        items.append(
+            {
+                "id": sample["id"],
+                "status": sample.get("status", "needs_review"),
+                "score": float(sample.get("score", 0) or 0),
+                "theme": sample.get("spec", {}).get("theme", ""),
+                "scene": sample.get("spec", {}).get("scene", ""),
+                "tags": sample.get("review", {}).get("tags", []),
+                "preview": preview,
+                "updated_at": sample.get("updated_at", ""),
+            }
+        )
+    return {
+        "items": items,
+        "total": len(filtered),
+        "source": "json_mirrors",
+        "warning": "SQLite 数据库不可读，当前列表来自镜像 JSON。",
+        "db_error": error,
+    }
+
+
+def get_sample_from_mirror(sample_id: str) -> Optional[Dict[str, Any]]:
+    safe_id = Path(sample_id).stem
+    candidates = []
+    for folder in (RAW_DIR, REVIEWED_DIR, REJECTED_DIR):
+        path = folder / f"{safe_id}.json"
+        if path.exists():
+            candidates.append(path)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    try:
+        return load_mirror_sample(candidates[0])
+    except Exception:
+        return None
 
 
 def job_update(job_id: str, **fields: Any) -> None:
@@ -657,6 +947,7 @@ def generate_and_review_one(
     max_turns: int,
     translate_to_zh: bool,
     defer_translation: bool = False,
+    generation_pool_connections: int = 16,
 ) -> Dict[str, Any]:
     """在线程池中生成并审核单条样本。
 
@@ -669,10 +960,24 @@ def generate_and_review_one(
         f"开始英文源逐轮对话：{spec.get('theme_en') or spec.get('theme')} | turns={min(int(spec.get('turns') or max_turns), max_turns)} | translate_to_zh={translate_to_zh}",
         item=idx,
     )
-    source_client = OpenAICompatibleClient(source_cfg)
-    simulator_client = OpenAICompatibleClient(simulator_cfg) if simulator_cfg and simulator_cfg.ready else None
+    source_client = get_thread_model_client(
+        source_cfg,
+        role="source",
+        pool_connections=generation_pool_connections,
+    )
+    if source_client is None:
+        raise RuntimeError("source model config missing")
+    simulator_client = get_thread_model_client(
+        simulator_cfg,
+        role="simulator",
+        pool_connections=generation_pool_connections,
+    )
     translator_client = (
-        OpenAICompatibleClient(translator_cfg)
+        get_thread_model_client(
+            translator_cfg,
+            role="translator_inline",
+            pool_connections=generation_pool_connections,
+        )
         if translator_cfg and translator_cfg.ready and translate_to_zh and not defer_translation
         else None
     )
@@ -693,7 +998,11 @@ def generate_and_review_one(
     turns = sum(1 for m in sample["messages"] if m.get("role") in {"user", "assistant"})
     job_log(job_id, f"逐轮对话完成：{turns} 条 user/assistant 消息，开始自动审核", item=idx)
 
-    judge_client = OpenAICompatibleClient(judge_cfg) if judge_cfg and judge_cfg.ready else None
+    judge_client = get_thread_model_client(
+        judge_cfg,
+        role="judge_inline",
+        pool_connections=generation_pool_connections,
+    )
     review = review_sample(sample, spec, judge_client=judge_client)
     job_log(
         job_id,
@@ -799,7 +1108,13 @@ def run_generation_job(
         sample = result["sample"]
         if translator_cfg is None or not translator_cfg.ready:
             raise RuntimeError("translator config missing")
-        translator_client = OpenAICompatibleClient(translator_cfg)
+        translator_client = get_thread_model_client(
+            translator_cfg,
+            role="translator_async",
+            pool_connections=max(translation_workers, req.concurrency, 16),
+        )
+        if translator_client is None:
+            raise RuntimeError("translator config missing")
         translated = translate_dialogue_sample(
             sample,
             translator_client,
@@ -809,7 +1124,11 @@ def run_generation_job(
         text = conversation_text(translated["messages"])
         turns = sum(1 for m in translated["messages"] if m.get("role") in {"user", "assistant"})
         job_log(job_id, f"翻译后样本完成：{turns} 条 user/assistant 消息，开始自动审核", item=idx)
-        judge_client = OpenAICompatibleClient(judge_cfg) if judge_cfg and judge_cfg.ready else None
+        judge_client = get_thread_model_client(
+            judge_cfg,
+            role="judge_async",
+            pool_connections=max(translation_workers, req.concurrency, 16),
+        )
         review = review_sample(translated, spec, judge_client=judge_client)
         job_log(
             job_id,
@@ -840,11 +1159,32 @@ def run_generation_job(
             and translator_cfg.ready
             and env_bool("ASYNC_TRANSLATION_STAGE", True)
         )
-        translation_workers = env_int(
-            "TRANSLATION_CONCURRENCY",
-            max(1, min(req.concurrency, 4)),
+        # 旧版 async translation 默认只给 4 个 worker；在 generation concurrency=64
+        # 时，英文对话会快速排队到翻译阶段，最终 completed 吞吐反而低于修复前。
+        # 默认让翻译并发跟随请求并发，必要时可用 TRANSLATION_CONCURRENCY 手动限流。
+        translation_workers = env_int("TRANSLATION_CONCURRENCY", req.concurrency, 1, 128)
+        if not defer_translation:
+            translation_workers = 1
+        http_pool_connections = env_int(
+            "HTTP_POOL_CONNECTIONS",
+            max(req.concurrency, translation_workers, 16),
             1,
-            64,
+            1024,
+        )
+        job_update(
+            job_id,
+            async_translation=defer_translation,
+            translation_concurrency=translation_workers if defer_translation else 0,
+            http_pool_connections=http_pool_connections,
+        )
+        job_log(
+            job_id,
+            (
+                "并发配置："
+                f"generation_workers={req.concurrency}, "
+                f"translation_workers={translation_workers if defer_translation else 0}, "
+                f"http_pool_connections={http_pool_connections}"
+            ),
         )
         with ThreadPoolExecutor(max_workers=req.concurrency) as gen_pool, ThreadPoolExecutor(max_workers=translation_workers) as trans_pool:
             gen_futures = {
@@ -860,6 +1200,7 @@ def run_generation_job(
                     max_turns=req.max_turns,
                     translate_to_zh=req.translate_to_zh,
                     defer_translation=defer_translation,
+                    generation_pool_connections=http_pool_connections,
                 ): (idx, spec)
                 for idx, spec in enumerate(specs, start=1)
             }
@@ -979,16 +1320,21 @@ def test_config(req: ConfigTestRequest) -> Dict[str, Any]:
 
 @app.get("/api/stats")
 def stats() -> Dict[str, Any]:
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT status, COUNT(*) as n, AVG(score) as avg_score FROM samples GROUP BY status"
-        ).fetchall()
-        total = conn.execute("SELECT COUNT(*) as n FROM samples").fetchone()["n"]
+    try:
+        with db() as conn:
+            rows = conn.execute(
+                "SELECT status, COUNT(*) as n, AVG(score) as avg_score FROM samples GROUP BY status"
+            ).fetchall()
+            total = conn.execute("SELECT COUNT(*) as n FROM samples").fetchone()["n"]
+    except sqlite3.DatabaseError as exc:
+        if not is_sqlite_corruption_error(exc):
+            raise
+        return stats_from_mirrors(str(exc))
     by_status = {
         row["status"]: {"count": row["n"], "avg_score": round(row["avg_score"] or 0, 2)}
         for row in rows
     }
-    return {"total": total, "by_status": by_status}
+    return {"total": total, "by_status": by_status, "source": "sqlite"}
 
 
 
@@ -1058,6 +1404,9 @@ def generate(req: GenerateRequest) -> Dict[str, Any]:
         "needs_review": 0,
         "rejected": 0,
         "concurrency": req.concurrency,
+        "async_translation": None,
+        "translation_concurrency": None,
+        "http_pool_connections": None,
         "max_turns": req.max_turns,
         "translate_to_zh": req.translate_to_zh,
         "same_aux_model": req.same_aux_model,
@@ -1197,12 +1546,17 @@ def list_samples(
         like = f"%{q}%"
         params.extend([like, like, like])
     where_sql = "WHERE " + " AND ".join(where) if where else ""
-    with db() as conn:
-        rows = conn.execute(
-            f"SELECT * FROM samples {where_sql} ORDER BY score DESC, updated_at DESC LIMIT ? OFFSET ?",
-            params + [limit, max(0, offset)],
-        ).fetchall()
-        total = conn.execute(f"SELECT COUNT(*) as n FROM samples {where_sql}", params).fetchone()["n"]
+    try:
+        with db() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM samples {where_sql} ORDER BY score DESC, updated_at DESC LIMIT ? OFFSET ?",
+                params + [limit, max(0, offset)],
+            ).fetchall()
+            total = conn.execute(f"SELECT COUNT(*) as n FROM samples {where_sql}", params).fetchone()["n"]
+    except sqlite3.DatabaseError as exc:
+        if not is_sqlite_corruption_error(exc):
+            raise
+        return list_samples_from_mirrors(status, q, limit, max(0, offset), str(exc))
 
     items = []
     for row in rows:
@@ -1220,13 +1574,21 @@ def list_samples(
                 "updated_at": sample["updated_at"],
             }
         )
-    return {"items": items, "total": total}
+    return {"items": items, "total": total, "source": "sqlite"}
 
 
 @app.get("/api/samples/{sample_id}")
 def get_sample(sample_id: str) -> Dict[str, Any]:
-    with db() as conn:
-        row = conn.execute("SELECT * FROM samples WHERE id = ?", (sample_id,)).fetchone()
+    try:
+        with db() as conn:
+            row = conn.execute("SELECT * FROM samples WHERE id = ?", (sample_id,)).fetchone()
+    except sqlite3.DatabaseError as exc:
+        if not is_sqlite_corruption_error(exc):
+            raise
+        sample = get_sample_from_mirror(sample_id)
+        if sample:
+            return sample
+        raise HTTPException(status_code=503, detail=f"SQLite 数据库不可读，且镜像中找不到样本：{exc}")
     if not row:
         raise HTTPException(status_code=404, detail="sample not found")
     return row_to_sample(row)
@@ -1276,12 +1638,25 @@ def export(req: ExportRequest) -> Dict[str, Any]:
     if req.only_dialogue_distillation:
         # 未翻译样本和英文->中文翻译样本都属于双模型逐轮蒸馏。
         params.extend(["two_model_dialogue", "english_dialogue_translated_zh"])
-    with db() as conn:
-        rows = conn.execute(
-            f"SELECT * FROM samples WHERE status IN ({placeholders}){where_extra} ORDER BY score DESC, updated_at DESC",
-            params,
-        ).fetchall()
-    samples = [row_to_sample(row) for row in rows]
+    try:
+        with db() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM samples WHERE status IN ({placeholders}){where_extra} ORDER BY score DESC, updated_at DESC",
+                params,
+            ).fetchall()
+        samples = [row_to_sample(row) for row in rows]
+    except sqlite3.DatabaseError as exc:
+        if not is_sqlite_corruption_error(exc):
+            raise
+        samples = []
+        allowed_sources = {"two_model_dialogue", "english_dialogue_translated_zh"}
+        for sample in load_all_mirror_samples():
+            if sample.get("status") not in statuses:
+                continue
+            if req.only_dialogue_distillation and sample.get("source") not in allowed_sources:
+                continue
+            samples.append(sample)
+        samples.sort(key=lambda s: (float(s.get("score", 0) or 0), str(s.get("updated_at") or "")), reverse=True)
     if not samples:
         raise HTTPException(
             status_code=400,
