@@ -66,6 +66,13 @@ SYDNEY_VLLM_CLEAR_COMPILE_CACHE="${SYDNEY_VLLM_CLEAR_COMPILE_CACHE:-1}"
 SYDNEY_VLLM_STARTUP_TIMEOUT_SEC="${SYDNEY_VLLM_STARTUP_TIMEOUT_SEC:-900}"
 SYDNEY_VLLM_EXTRA_ARGS="${SYDNEY_VLLM_EXTRA_ARGS:-}"
 
+# FPHam Sydney 系列 tokenizer 没自带 chat_template, transformers v4.44+ 不再兜底,
+# 所以必须显式传 --chat-template, 否则 /v1/chat/completions 会直接 HTTP 400.
+# 默认写一份 Vicuna v1.1 模板 (USER:/ASSISTANT:), Free_Sydney_V2_13b 用这个.
+# 想换成 alpaca/llama2 风格可把 SYDNEY_VLLM_CHAT_TEMPLATE 指到自己的 .jinja 文件.
+SYDNEY_VLLM_CHAT_TEMPLATE="${SYDNEY_VLLM_CHAT_TEMPLATE:-$WORKDIR/chat_template_vicuna_v1.1.jinja}"
+SYDNEY_VLLM_AUTO_WRITE_CHAT_TEMPLATE="${SYDNEY_VLLM_AUTO_WRITE_CHAT_TEMPLATE:-1}"
+
 # Cloudflare Tunnel 同 setup_sydney_rocm.sh
 USE_TUNNEL="${USE_TUNNEL:-0}"
 CLOUDFLARED_LOCAL_PATH="${CLOUDFLARED_LOCAL_PATH:-/mnt/cloudflared}"
@@ -103,7 +110,7 @@ while [[ $# -gt 0 ]]; do
   esac; shift
 done
 
-log(){ printf '\033[1;36m[setup-sydney-vllm]\033[0m %s\n' "$*"; }
+log(){ printf '\033[1;36m[setup-sydney-vllm]\033[0m %s\n' "$*" >&2; }
 warn(){ printf '\033[1;33m[warn]\033[0m %s\n' "$*" >&2; }
 err(){ printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; }
 have(){ command -v "$1" >/dev/null 2>&1; }
@@ -193,6 +200,36 @@ ensure_model_downloaded(){
   fi
 }
 
+ensure_chat_template(){
+  # 用户给了路径 -> 必须真存在
+  if [[ "$SYDNEY_VLLM_AUTO_WRITE_CHAT_TEMPLATE" != "1" ]]; then
+    [[ -f "$SYDNEY_VLLM_CHAT_TEMPLATE" ]] || { err "chat template 不存在: $SYDNEY_VLLM_CHAT_TEMPLATE"; exit 1; }
+    return 0
+  fi
+  [[ -f "$SYDNEY_VLLM_CHAT_TEMPLATE" ]] && { log "chat template 已就绪: $SYDNEY_VLLM_CHAT_TEMPLATE"; return 0; }
+  log "写入默认 Vicuna v1.1 chat template -> $SYDNEY_VLLM_CHAT_TEMPLATE"
+  mkdir -p "$(dirname "$SYDNEY_VLLM_CHAT_TEMPLATE")"
+  cat > "$SYDNEY_VLLM_CHAT_TEMPLATE" <<'JINJA'
+{%- if messages[0]['role'] == 'system' -%}
+{{- messages[0]['content'].strip() + ' ' -}}
+{%- set loop_messages = messages[1:] -%}
+{%- else -%}
+{{- "A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions. " -}}
+{%- set loop_messages = messages -%}
+{%- endif -%}
+{%- for message in loop_messages -%}
+{%- if message['role'] == 'user' -%}
+{{- 'USER: ' + message['content'].strip() + ' ' -}}
+{%- elif message['role'] == 'assistant' -%}
+{{- 'ASSISTANT: ' + message['content'].strip() + eos_token + ' ' -}}
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+{{- 'ASSISTANT:' -}}
+{%- endif -%}
+JINJA
+}
+
 apply_rocm_envs(){
   export HF_ENDPOINT="$HF_ENDPOINT"
   export PYTORCH_HIP_ALLOC_CONF="${PYTORCH_HIP_ALLOC_CONF:-expandable_segments:True}"
@@ -219,6 +256,7 @@ build_args(){
     --max-model-len "$SYDNEY_VLLM_MAX_MODEL_LEN"
     --max-num-seqs "$SYDNEY_VLLM_MAX_NUM_SEQS"
     --max-num-batched-tokens "$SYDNEY_VLLM_MAX_NUM_BATCHED_TOKENS"
+    --chat-template "$SYDNEY_VLLM_CHAT_TEMPLATE"
   )
   [[ "$SYDNEY_VLLM_TRUST_REMOTE_CODE" == "1" ]] && _a+=(--trust-remote-code)
   [[ "$SYDNEY_VLLM_ENFORCE_EAGER" == "1" ]] && _a+=(--enforce-eager)
@@ -238,6 +276,7 @@ start_vllm(){
   fi
   check_vllm_available
   ensure_model_downloaded
+  ensure_chat_template
   [[ "$SYDNEY_VLLM_CLEAR_COMPILE_CACHE" == "1" ]] && rm -rf /root/.cache/vllm/torch_compile_cache 2>/dev/null || true
   apply_rocm_envs
   local args; build_args args
@@ -277,14 +316,14 @@ stop_vllm(){
 
 ensure_cloudflared(){
   local bin="$BIN_DIR/cloudflared"
-  if [[ -x "$bin" ]]; then echo "$bin"; return 0; fi
+  if [[ -x "$bin" ]]; then printf '%s' "$bin"; return 0; fi
   if [[ -x "$CLOUDFLARED_LOCAL_PATH" ]]; then
-    cp "$CLOUDFLARED_LOCAL_PATH" "$bin"; chmod +x "$bin"; echo "$bin"; return 0
+    cp "$CLOUDFLARED_LOCAL_PATH" "$bin"; chmod +x "$bin"; printf '%s' "$bin"; return 0
   fi
   for url in $CLOUDFLARED_URL_FALLBACKS; do
     log "下载 cloudflared: $url"
     if curl -fsSL --connect-timeout 15 --max-time 600 -o "$bin.tmp" "$url"; then
-      mv "$bin.tmp" "$bin"; chmod +x "$bin"; echo "$bin"; return 0
+      mv "$bin.tmp" "$bin"; chmod +x "$bin"; printf '%s' "$bin"; return 0
     fi
     rm -f "$bin.tmp"
   done
