@@ -505,6 +505,19 @@ class OpenAICompatibleClient:
         self.config = config
         self.base_url = normalize_base_url(config.base_url)
         self.api_protocol = normalize_api_protocol(config.api_protocol)
+        # 持久连接池：避免每次请求重建 TCP 连接，对多轮对话效果显著。
+        # max_keepalive_connections 按并发上限设置；max_connections 留余量。
+        _max_ka = max(10, int(getattr(config, "concurrency", 10) or 10))
+        self._http = httpx.Client(
+            timeout=httpx.Timeout(config.timeout, connect=min(30.0, config.timeout)),
+            limits=httpx.Limits(max_keepalive_connections=_max_ka, max_connections=_max_ka * 2),
+        )
+
+    def __del__(self) -> None:
+        try:
+            self._http.close()
+        except Exception:  # noqa: BLE001
+            pass
 
     def chat(
         self,
@@ -518,11 +531,13 @@ class OpenAICompatibleClient:
         frequency_penalty: Optional[float] = None,
         presence_penalty: Optional[float] = None,
         repeat_penalty: Optional[float] = None,
+        slot_id: Optional[int] = None,
     ) -> str:
         """调用配置的协议并返回纯文本内容。
 
         为了不改动上层数据生成/审核逻辑，方法名仍叫 chat；实际默认走
         Responses API：POST {base_url}/responses。
+        slot_id：llama.cpp 专用，绑定 KV Cache slot，避免多轮对话重新 prefill。
         """
 
         if self.api_protocol == "responses":
@@ -562,6 +577,7 @@ class OpenAICompatibleClient:
             frequency_penalty=frequency_penalty,
             presence_penalty=presence_penalty,
             repeat_penalty=repeat_penalty,
+            slot_id=slot_id,
         )
 
     def _headers(self) -> Dict[str, str]:
@@ -648,20 +664,18 @@ class OpenAICompatibleClient:
         这里对这些瞬时错误做指数退避重试；非瞬时 4xx 仍直接暴露。
         """
 
-        timeout = httpx.Timeout(self.config.timeout, connect=min(30.0, self.config.timeout))
         max_attempts = max(1, int(getattr(self.config, "retries", 2) or 0) + 1)
         retry_statuses = {408, 409, 425, 429, 500, 502, 503, 504}
         last_exc: Exception | None = None
         for attempt in range(1, max_attempts + 1):
             try:
-                with httpx.Client(timeout=timeout) as client:
-                    resp = client.post(endpoint, headers=headers, json=body)
-                    if resp.status_code in retry_statuses and attempt < max_attempts:
-                        delay = float(getattr(self.config, "retry_backoff", 1.5) or 1.5) * attempt
-                        time.sleep(min(delay, 10.0))
-                        continue
-                    resp.raise_for_status()
-                    return resp.json()
+                resp = self._http.post(endpoint, headers=headers, json=body)
+                if resp.status_code in retry_statuses and attempt < max_attempts:
+                    delay = float(getattr(self.config, "retry_backoff", 1.5) or 1.5) * attempt
+                    time.sleep(min(delay, 10.0))
+                    continue
+                resp.raise_for_status()
+                return resp.json()
             except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.ConnectError, httpx.RemoteProtocolError) as exc:
                 last_exc = exc
                 if attempt >= max_attempts:
@@ -685,6 +699,7 @@ class OpenAICompatibleClient:
         frequency_penalty: Optional[float],
         presence_penalty: Optional[float],
         repeat_penalty: Optional[float],
+        slot_id: Optional[int] = None,
     ) -> str:
         """调用 Chat Completions 并返回 message.content。"""
 
@@ -708,6 +723,12 @@ class OpenAICompatibleClient:
             # 所以仅在环境变量开启或 legacy/Sydney 自建端常用时发送。
             if self.api_protocol == "legacy_chat_completions" or env_bool("SEND_REPEAT_PENALTY", False):
                 body["repeat_penalty"] = repeat_penalty
+        # llama.cpp KV Cache 复用：绑定 slot_id 让同一样本的多轮请求落到同一 slot，
+        # 避免每轮重新 prefill 全部历史。cache_prompt=True 告知服务端保留 KV Cache。
+        # 仅对 llama.cpp 协议发送；其他后端会忽略未知字段，但 slot_id=-1 可能引起歧义。
+        if slot_id is not None and self.api_protocol in ("legacy_chat_completions", "chat_completions"):
+            body["slot_id"] = slot_id
+            body["cache_prompt"] = True
         # 旧逻辑在 stop_sequences=None 时给所有 Chat Completions 请求都发送
         # DEFAULT_STOP_SEQUENCES（23 个）。火山/智谱/OpenAI-compatible 外部网关
         # 通常限制 stop 最多 4 个，导致 Human/Translator 测试直接 400。
@@ -2960,6 +2981,11 @@ def generate_dialogue_sample(
     end_decisions: List[Dict[str, Any]] = []
     trend_warnings: List[Dict[str, Any]] = []
     focus_repairs: List[Dict[str, Any]] = []
+    # llama.cpp KV Cache slot 绑定：同一样本的所有轮次使用同一 slot_id，
+    # 让后端复用 Turn N 的 KV Cache 而不是重新 prefill。
+    # 仅在 LLAMACPP_KV_CACHE_SLOTS > 0 时启用；默认关闭以兼容非 llama.cpp 后端。
+    _kv_slots = env_int("LLAMACPP_KV_CACHE_SLOTS", 0, 0, 512)
+    _source_slot_id: Optional[int] = (abs(hash(f"{spec.get('theme','')}-{spec.get('scene','')}-{id(rng)}")) % _kv_slots) if _kv_slots > 0 else None
 
     def emit(message: str, *, kind: str = "log", role: str | None = None, turn: int | None = None) -> None:
         event = {"time": utc_now(), "message": message, "kind": kind}
@@ -3063,6 +3089,7 @@ def generate_dialogue_sample(
             frequency_penalty=sampling["frequency_penalty"],
             presence_penalty=sampling["presence_penalty"],
             repeat_penalty=sampling["repeat_penalty"],
+            slot_id=_source_slot_id,
         )
         assistant_text = clean_dialogue_text(assistant_raw, speaker="assistant")
         if not assistant_text:
