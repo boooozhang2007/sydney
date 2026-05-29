@@ -506,11 +506,14 @@ class OpenAICompatibleClient:
         self.base_url = normalize_base_url(config.base_url)
         self.api_protocol = normalize_api_protocol(config.api_protocol)
         # 持久连接池：避免每次请求重建 TCP 连接，对多轮对话效果显著。
-        # max_keepalive_connections 按并发上限设置；max_connections 留余量。
-        _max_ka = max(10, int(getattr(config, "concurrency", 10) or 10))
+        # ModelConfig 没有 concurrency 字段，连接池上限改为跟随生成并发数
+        # （GENERATION_CONCURRENCY，与 ThreadPoolExecutor 的 max_workers 一致），
+        # 否则高并发时大量线程会争抢固定的 10 个连接而排队。
+        _pool = env_int("HTTP_POOL_CONNECTIONS", env_int("GENERATION_CONCURRENCY", 16, 1, 256), 1, 512)
+        _pool = max(_pool, 16)
         self._http = httpx.Client(
             timeout=httpx.Timeout(config.timeout, connect=min(30.0, config.timeout)),
-            limits=httpx.Limits(max_keepalive_connections=_max_ka, max_connections=_max_ka * 2),
+            limits=httpx.Limits(max_keepalive_connections=_pool, max_connections=_pool * 2),
         )
 
     def __del__(self) -> None:
@@ -2866,6 +2869,28 @@ def build_simulator_chat_messages(
             }
         )
     return messages
+
+
+# Human simulator 在 user 生成调用里顺带给出的“自然结束”信号。
+# 把结束判定搭车在 user 生成请求上，省掉每轮一次独立的 end_decision LLM 调用，
+# 同时保持“由模型判断是否结束”（非 CPU 启发式），且不影响 user 消息这条训练数据本身。
+SIMULATOR_END_SENTINEL = "<<END_CHAT>>"
+
+
+def _simulator_signaled_end(raw: str) -> bool:
+    """判断 simulator 是否给出了结束信号（而不是一条正常 user 消息）。
+
+    保守策略：只有当输出本质上就是 sentinel（去掉 sentinel 后残余很短）时才算结束，
+    避免模型在正常消息里偶然带出 token 就误判结束。
+    """
+
+    if not raw:
+        return False
+    s = raw.strip()
+    if SIMULATOR_END_SENTINEL not in s:
+        return False
+    residual = s.replace(SIMULATOR_END_SENTINEL, "").strip()
+    return len(residual) <= 8
 
 
 def _extract_boolish(value: Any) -> Optional[bool]:
