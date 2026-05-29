@@ -16,6 +16,7 @@ import re
 import time
 import uuid
 import math
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
@@ -2452,6 +2453,158 @@ def dialogue_trend_diagnostics(transcript: List[Dict[str, str]], spec: Optional[
     }
 
 
+class DialogueTrendTracker:
+    """Append-only diagnostics tracker for the generation hot path.
+
+    Generation only appends one user/assistant message at a time. This keeps
+    cumulative counters and recomputes only small rolling windows, instead of
+    rescanning the full transcript on every before/after-turn check.
+    """
+
+    def __init__(self, spec: Dict[str, Any]):
+        self.spec = spec
+        self.allowed_domains = _allowed_topic_domains_for_spec(spec)
+        self._reset()
+
+    def _reset(self) -> None:
+        self.messages: List[Dict[str, str]] = []
+        self.assistants: List[str] = []
+        self.users: List[str] = []
+        self.formula_hits = 0
+        self.emoji_hits = 0
+        self.positive_hits = 0
+        self.vulnerability_hits = 0
+        self.tension_hits = 0
+        self.domain_counts: Counter[str] = Counter()
+        self.message_domain_counts: List[Dict[str, int]] = []
+        self._last_len = -1
+        self._last_value: Dict[str, Any] | None = None
+
+    def _append_message(self, msg: Dict[str, str]) -> None:
+        role = msg.get("role")
+        if role not in {"user", "assistant"}:
+            return
+        content = str(msg.get("content") or "")
+        self.messages.append({"role": str(role), "content": content})
+        if role == "assistant":
+            self.assistants.append(content)
+            self.formula_hits += _repetitive_formula_hits(content)
+            self.emoji_hits += _emoji_count(content)
+            self.vulnerability_hits += _marker_count(content, VULNERABILITY_MARKERS)
+            self.tension_hits += _marker_count(content, SYDNEY_TENSION_MARKERS)
+        else:
+            self.users.append(content)
+        self.positive_hits += _marker_count(content, POSITIVE_HYPE_MARKERS)
+        counts = _topic_domain_counts(content)
+        self.message_domain_counts.append(counts)
+        self.domain_counts.update(counts)
+
+    def update(self, transcript: List[Dict[str, str]]) -> Dict[str, Any]:
+        role_messages = [m for m in transcript if m.get("role") in {"user", "assistant"}]
+        if len(role_messages) < len(self.messages):
+            self._reset()
+        if self.messages and role_messages[: len(self.messages)] != self.messages:
+            # Normal generation is append-only. If old content changed, rebuild.
+            self._reset()
+        for msg in role_messages[len(self.messages) :]:
+            self._append_message(msg)
+        if self._last_len == len(self.messages) and self._last_value is not None:
+            return self._last_value
+        self._last_len = len(self.messages)
+        self._last_value = self._snapshot()
+        return self._last_value
+
+    def _topic_drift_snapshot(self) -> Dict[str, Any]:
+        allowed = self.allowed_domains
+        all_counts = dict(self.domain_counts)
+        seen = set(all_counts)
+        unexpected = seen - allowed
+        recent_counter: Counter[str] = Counter()
+        for counts in self.message_domain_counts[-4:]:
+            recent_counter.update(counts)
+        recent_counts = dict(recent_counter)
+        recent_unexpected = set(recent_counts) - allowed
+
+        total_hits = sum(all_counts.values())
+        entropy = 0.0
+        if total_hits > 0:
+            for c in all_counts.values():
+                p = c / total_hits
+                entropy -= p * math.log(p + 1e-9, 2)
+
+        warnings: List[str] = []
+        severity = 0.0
+        if len(recent_unexpected) >= 2:
+            warnings.append("最近几轮跳到多个无关话题域")
+            severity += 2.2 + 0.35 * len(recent_unexpected)
+        elif len(recent_unexpected) == 1 and len(self.messages) >= 8:
+            warnings.append("最近话题出现轻微偏移")
+            severity += 0.8
+        if len(seen) >= 5 and entropy >= 1.75:
+            warnings.append("整段话题域过多，单样本发散")
+            severity += 1.4
+        if len(unexpected) >= 3:
+            warnings.append("出现过多蓝图外话题域")
+            severity += 1.2
+
+        return {
+            "severity": round(severity, 2),
+            "warnings": warnings,
+            "allowed_domains": sorted(allowed),
+            "seen_domains": sorted(seen),
+            "recent_domains": sorted(recent_counts),
+            "unexpected_domains": sorted(unexpected),
+            "recent_unexpected_domains": sorted(recent_unexpected),
+            "domain_counts": all_counts,
+            "domain_entropy": round(entropy, 3),
+        }
+
+    def _snapshot(self) -> Dict[str, Any]:
+        warnings: List[str] = []
+        severity = 0.0
+        if self.formula_hits >= 2:
+            warnings.append("检测到固定公式/复读机结构")
+            severity += 2.5 + min(3.0, self.formula_hits * 0.6)
+
+        recent = self.assistants[-4:]
+        if len(recent) >= 3:
+            sims = [_similarity(a[:90], b[:90]) for a, b in zip(recent, recent[1:])]
+            if sims and sum(1 for sim in sims if sim > 0.58) >= 2:
+                warnings.append("最近 assistant 句式连续相似")
+                severity += 2.0
+
+        if (
+            len(self.assistants) >= 4
+            and self.emoji_hits / max(1, len(self.assistants)) >= 1.8
+            and self.positive_hits >= 8
+            and self.vulnerability_hits == 0
+        ):
+            warnings.append("积极 emoji/捧场过载，缺少脆弱感")
+            severity += 2.0
+        if len(self.assistants) >= 5 and self.tension_hits == 0 and self.vulnerability_hits == 0:
+            warnings.append("中后段缺少 Sydney 式拉扯/不安全感")
+            severity += 1.4
+        if any(_ngram_repetition_score(a) > 0.46 for a in self.assistants[-3:]):
+            warnings.append("单条 assistant 内部重复偏高")
+            severity += 1.4
+
+        drift = self._topic_drift_snapshot()
+        if drift.get("warnings"):
+            warnings.extend(drift["warnings"])
+            severity += float(drift.get("severity", 0.0) or 0.0)
+
+        return {
+            "severity": round(severity, 2),
+            "warnings": list(dict.fromkeys(warnings)),
+            "formula_hits": self.formula_hits,
+            "emoji_hits": self.emoji_hits,
+            "positive_hits": self.positive_hits,
+            "vulnerability_hits": self.vulnerability_hits,
+            "tension_hits": self.tension_hits,
+            "topic_drift": drift,
+        }
+
+
 def build_source_steering_user_message(diagnostics: Dict[str, Any], spec: Dict[str, Any]) -> str:
     """给 Sydney/source 的一次性轻量 steering。
 
@@ -2664,7 +2817,7 @@ def translate_dialogue_sample(
             {"role": "user", "content": build_translation_user_prompt(source_messages, spec)},
         ],
         temperature=0.25,
-        max_tokens=5000,
+        max_tokens=env_int("TRANSLATOR_MAX_TOKENS", 5000, 512, 12000),
         response_format_json=True,
         stop_sequences=[],
     )
@@ -2805,11 +2958,14 @@ def build_simulator_chat_messages(
     turn_index: int,
     max_turns: int,
     diagnostics: Optional[Dict[str, Any]] = None,
+    allow_end_signal: bool = False,
 ) -> List[Dict[str, str]]:
     """为 Human simulator 构造带完整上下文的 messages。
 
     明确给模型：所处环境、最近 transcript、当前任务和输出契约。
     transcript 是训练视角：user=模拟人类，assistant=Sydney/source。
+    allow_end_signal：达到最小轮数后，允许 simulator 在判定自然结束时直接输出
+    SIMULATOR_END_SENTINEL，省掉每轮一次独立的 end_decision LLM 调用。
     """
 
     english = str(spec.get("source_language") or spec.get("language") or "").lower().startswith("en")
@@ -2850,6 +3006,22 @@ def build_simulator_chat_messages(
             }
         )
     else:
+        end_signal_clause_en = (
+            f"End-signal option: ONLY if the chat has reached a fully natural small resolution "
+            f"AND you (the human) would realistically stop texting now (e.g. sleep, leaving, talk tomorrow), "
+            f"reply with EXACTLY this token and nothing else: {SIMULATOR_END_SENTINEL}. "
+            "Sydney is clingy and dramatic, so do NOT end just because Sydney is being intense — "
+            "only end when YOU as the human have a real reason to log off. "
+            "Otherwise write a normal next user message as usual.\n"
+            if allow_end_signal else ""
+        )
+        end_signal_clause_zh = (
+            f"结束信号选项：仅当对话已经走到一个自然的小收束、且你（人类）此刻会真实地停止聊天"
+            f"（比如要睡了、要出门、明天再聊），才输出且只输出这个 token：{SIMULATOR_END_SENTINEL}。"
+            "Sydney 性格粘人又戏剧化，不要因为对方情绪强烈就结束——"
+            "只有你这一侧作为人类有真实下线理由时才用此信号。否则照常写下一条 user 消息。\n"
+            if allow_end_signal else ""
+        )
         messages.append(
             {
                 "role": "user",
@@ -2863,6 +3035,7 @@ def build_simulator_chat_messages(
                         if english
                         else "角色确认：你是你_人类用户，人类朋友。朋友_Sydney助手是对方。任务：只写你这一侧的下一条 user 消息，不要写 Sydney 回复。必须承接 transcript 里的真实上下文。\n"
                     )
+                    + (end_signal_clause_en if english else end_signal_clause_zh)
                     + build_simulator_continue_prompt_for_spec(spec, turn_index, max_turns)
                     + focus_warning
                 ),
@@ -2891,6 +3064,52 @@ def _simulator_signaled_end(raw: str) -> bool:
         return False
     residual = s.replace(SIMULATOR_END_SENTINEL, "").strip()
     return len(residual) <= 8
+
+
+class DialogueTrendTracker:
+    """对 dialogue_trend_diagnostics 做调用级缓存的轻量包装。
+
+    原 dialogue_trend_diagnostics 每轮被调 3 次（pre-user / pre-assistant / post-assistant），
+    每次都要从头扫整段 transcript（regex + SequenceMatcher），是 O(turns²) 的累计开销。
+    这个 tracker 做两件事：
+    1) 结果级缓存：以 transcript 的角色+长度+末两条内容作为状态键，未变则直接返回上次结果；
+    2) 复用单次完整诊断结果——主循环里把 pre_user_diag 直接复用为上一轮 post_diag，
+       final 阶段也命中缓存。语义与直接调用 dialogue_trend_diagnostics 完全一致。
+    """
+
+    __slots__ = ("_spec", "_cache_key", "_cache_value")
+
+    def __init__(self, spec: Optional[Dict[str, Any]] = None) -> None:
+        self._spec = spec
+        self._cache_key: Optional[tuple] = None
+        self._cache_value: Optional[Dict[str, Any]] = None
+
+    @staticmethod
+    def _make_key(transcript: List[Dict[str, str]]) -> tuple:
+        """轻量 transcript 指纹：长度 + 末两条角色与前 64 字符。
+
+        生成路径中 transcript 是 append-only，长度变化即内容变化；
+        加末两条采样防止极端边界改动被漏。
+        """
+        n = len(transcript)
+        if n == 0:
+            return (0,)
+        last = transcript[-1]
+        prev = transcript[-2] if n >= 2 else None
+        last_role = str(last.get("role") or "")
+        last_head = str(last.get("content") or "")[:64]
+        prev_role = str(prev.get("role") or "") if prev else ""
+        prev_head = str(prev.get("content") or "")[:64] if prev else ""
+        return (n, last_role, last_head, prev_role, prev_head)
+
+    def update(self, transcript: List[Dict[str, str]]) -> Dict[str, Any]:
+        key = self._make_key(transcript)
+        if self._cache_key == key and self._cache_value is not None:
+            return self._cache_value
+        result = dialogue_trend_diagnostics(transcript, self._spec)
+        self._cache_key = key
+        self._cache_value = result
+        return result
 
 
 def _extract_boolish(value: Any) -> Optional[bool]:
@@ -3022,15 +3241,20 @@ def generate_dialogue_sample(
         if on_event:
             on_event(message, kind=kind, role=role, turn=turn)
 
+    trend_tracker = DialogueTrendTracker(spec)
+    last_diag = trend_tracker.update(messages[1:])
+    use_inband_end = env_bool("SIMULATOR_INBAND_END_DECISION", True)
+
     for turn in range(1, target_turns + 1):
         user_text = ""
         fallback_reason = ""
-        pre_user_diag = dialogue_trend_diagnostics(messages[1:], spec)
+        pre_user_diag = last_diag
         focus_repair_mode = (
             turn > 1
             and float((pre_user_diag.get("topic_drift") or {}).get("severity", 0.0) or 0.0)
             >= env_float("TOPIC_DRIFT_USER_REPAIR_THRESHOLD", 2.0, 0.0, 10.0)
         )
+        allow_end_signal = bool(use_inband_end and simulator_client is not None and turn > min_turns)
         if simulator_client is not None:
             try:
                 simulator_messages = build_simulator_chat_messages(
@@ -3039,6 +3263,7 @@ def generate_dialogue_sample(
                     turn_index=turn,
                     max_turns=target_turns,
                     diagnostics=pre_user_diag,
+                    allow_end_signal=allow_end_signal,
                 )
                 user_raw = simulator_client.chat(
                     simulator_messages,
@@ -3047,6 +3272,23 @@ def generate_dialogue_sample(
                     response_format_json=False,
                     stop_sequences=AUX_STOP_SEQUENCES,
                 )
+                if allow_end_signal and _simulator_signaled_end(user_raw):
+                    ended_turn = max(0, turn - 1)
+                    end_decisions.append(
+                        {
+                            "turn": ended_turn,
+                            "should_end": True,
+                            "reason": "simulator emitted in-band end sentinel before next user turn",
+                            "source": "human_model_inband",
+                        }
+                    )
+                    emit(
+                        f"Human 结束判定：自然收束于第 {ended_turn}/{target_turns} 轮（human_model_inband：sentinel）",
+                        kind="log",
+                        turn=ended_turn,
+                    )
+                    break
+
                 user_text = clean_dialogue_text(user_raw, speaker="user")
                 ok, reason = user_message_is_usable(user_text, messages[1:])
                 if ok:
@@ -3099,7 +3341,7 @@ def generate_dialogue_sample(
         messages.append({"role": "user", "content": user_text})
         emit(user_text, kind="chat", role="user", turn=turn)
 
-        pre_diag = dialogue_trend_diagnostics(messages[1:], spec)
+        pre_diag = trend_tracker.update(messages[1:])
         if pre_diag.get("warnings"):
             trend_warnings.append({"turn": turn, "phase": "before_assistant", **pre_diag})
             emit(f"趋势提醒：{'；'.join(pre_diag['warnings'])}，本轮将提高多样性/轻量转向", kind="warn", turn=turn)
@@ -3126,7 +3368,8 @@ def generate_dialogue_sample(
         messages.append({"role": "assistant", "content": assistant_text})
         emit(assistant_text, kind="chat", role="assistant", turn=turn)
 
-        post_diag = dialogue_trend_diagnostics(messages[1:], spec)
+        post_diag = trend_tracker.update(messages[1:])
+        last_diag = post_diag
         if post_diag.get("warnings"):
             trend_warnings.append({"turn": turn, "phase": "after_assistant", **post_diag})
             if float(post_diag.get("severity", 0.0) or 0.0) >= 3.0:
@@ -3136,26 +3379,36 @@ def generate_dialogue_sample(
                 emit(f"话题发散达到阈值，提前自然收束于第 {turn}/{target_turns} 轮", kind="warn", turn=turn)
                 break
 
-        should_end, end_reason, end_source = should_end_dialogue(
-            simulator_client,
-            spec,
-            messages[1:],
-            turn_index=turn,
-            max_turns=target_turns,
-            min_turns=min_turns,
-            rng=rng,
-        )
-        end_decisions.append(
-            {
-                "turn": turn,
-                "should_end": should_end,
-                "reason": end_reason,
-                "source": end_source,
-            }
-        )
-        if should_end:
-            emit(f"Human 结束判定：自然收束于第 {turn}/{target_turns} 轮（{end_source}：{end_reason}）", kind="log", turn=turn)
-            break
+        if not use_inband_end:
+            should_end, end_reason, end_source = should_end_dialogue(
+                simulator_client,
+                spec,
+                messages[1:],
+                turn_index=turn,
+                max_turns=target_turns,
+                min_turns=min_turns,
+                rng=rng,
+            )
+            end_decisions.append(
+                {
+                    "turn": turn,
+                    "should_end": should_end,
+                    "reason": end_reason,
+                    "source": end_source,
+                }
+            )
+            if should_end:
+                emit(f"Human 结束判定：自然收束于第 {turn}/{target_turns} 轮（{end_source}：{end_reason}）", kind="log", turn=turn)
+                break
+        elif turn >= min_turns:
+            end_decisions.append(
+                {
+                    "turn": turn,
+                    "should_end": False,
+                    "reason": "next simulator(user) call will decide via in-band sentinel",
+                    "source": "human_model_inband_pending",
+                }
+            )
 
     sample_id = f"syd_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:10]}"
     actual_turn_pairs = sum(1 for m in messages if m.get("role") == "assistant")
@@ -3179,9 +3432,10 @@ def generate_dialogue_sample(
         "end_decisions": end_decisions[-40:],
         "trend_warnings": trend_warnings[-60:],
         "focus_repairs": focus_repairs[-40:],
-        "final_trend_diagnostics": dialogue_trend_diagnostics(messages[1:], spec),
+        "final_trend_diagnostics": trend_tracker.update(messages[1:]),
         "ended_naturally": actual_turn_pairs < target_turns,
         "generation_events": generation_events[-80:],
+        "simulator_inband_end_decision": use_inband_end,
     }
     sample = {
         "id": sample_id,

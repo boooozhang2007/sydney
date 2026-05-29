@@ -7,7 +7,7 @@ import threading
 import time
 import uuid
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,10 +25,11 @@ from data_generator import (
     OpenAICompatibleClient,
     generate_dialogue_sample,
     make_generation_specs,
+    translate_dialogue_sample,
     to_sharegpt,
     write_jsonl,
 )
-from deduper import conversation_text, find_duplicate, fingerprint
+from deduper import DedupIndex, conversation_text, fingerprint
 from notebook_exporter import TARGET_MODELS, export_unsloth_notebook
 
 load_dotenv()
@@ -655,6 +656,7 @@ def generate_and_review_one(
     judge_cfg: ModelConfig | None,
     max_turns: int,
     translate_to_zh: bool,
+    defer_translation: bool = False,
 ) -> Dict[str, Any]:
     """在线程池中生成并审核单条样本。
 
@@ -669,16 +671,24 @@ def generate_and_review_one(
     )
     source_client = OpenAICompatibleClient(source_cfg)
     simulator_client = OpenAICompatibleClient(simulator_cfg) if simulator_cfg and simulator_cfg.ready else None
-    translator_client = OpenAICompatibleClient(translator_cfg) if translator_cfg and translator_cfg.ready else None
+    translator_client = (
+        OpenAICompatibleClient(translator_cfg)
+        if translator_cfg and translator_cfg.ready and translate_to_zh and not defer_translation
+        else None
+    )
     sample = generate_dialogue_sample(
         source_client,
         simulator_client,
         spec,
         max_turns=max_turns,
         translator_client=translator_client,
-        translate_to_zh=translate_to_zh,
+        translate_to_zh=bool(translate_to_zh and not defer_translation),
         on_event=lambda msg, **ev: job_log(job_id, msg, item=idx, **ev),
     )
+    if translate_to_zh and defer_translation:
+        job_log(job_id, "英文源逐轮对话完成，翻译进入独立并发队列", item=idx)
+        return {"idx": idx, "spec": spec, "sample": sample, "review": None, "text": conversation_text(sample["messages"]), "needs_translation": True}
+
     text = conversation_text(sample["messages"])
     turns = sum(1 for m in sample["messages"] if m.get("role") in {"user", "assistant"})
     job_log(job_id, f"逐轮对话完成：{turns} 条 user/assistant 消息，开始自动审核", item=idx)
@@ -723,12 +733,122 @@ def run_generation_job(
         previous_topic_counts=get_existing_topic_counts(),
     )
     existing = get_existing_texts()
+    dedup_index = DedupIndex(existing)
     generated: List[Dict[str, Any]] = []
 
+    def finalize_result(result: Dict[str, Any]) -> None:
+        """Serial DB/dedup section kept small; model work has already finished."""
+
+        nonlocal generated
+        idx = int(result["idx"])
+        spec = result["spec"]
+        sample = result["sample"]
+        review = result.get("review")
+        text = result["text"]
+        if review is None:
+            raise RuntimeError("internal error: review missing before finalize")
+
+        is_dup, dup_id, dup_score = dedup_index.find(text)
+        if is_dup:
+            review = apply_duplicate_penalty(review, dup_id, dup_score)
+            sample["duplicate_of"] = dup_id
+            job_log(
+                job_id,
+                f"近重复，自动丢弃：duplicate_of={dup_id}, similarity={dup_score:.3f}",
+                level="warn",
+                item=idx,
+            )
+
+        sample["review"] = review
+        sample["status"] = review.get("status", "needs_review")
+        sample["score"] = float(review.get("overall", 0) or 0)
+        sample["updated_at"] = utc_now()
+        save_sample(sample)
+        write_status_mirror(sample)
+
+        generated.append(
+            {
+                "id": sample["id"],
+                "status": sample["status"],
+                "score": sample["score"],
+                "theme": spec.get("theme"),
+            }
+        )
+        existing.append((sample["id"], text))
+        dedup_index.add(sample["id"], text)
+
+        status = sample["status"]
+        job_inc(
+            job_id,
+            completed=1,
+            generated=1,
+            accepted=1 if status == "accepted" else 0,
+            needs_review=1 if status == "needs_review" else 0,
+            rejected=1 if status == "rejected" else 0,
+        )
+        job_log(
+            job_id,
+            f"已保存：{sample['id']} | {status} | score={sample['score']:.2f}",
+            level="ok" if status == "accepted" else "warn" if status == "needs_review" else "error",
+            item=idx,
+        )
+
+    def translate_and_review_result(result: Dict[str, Any]) -> Dict[str, Any]:
+        idx = int(result["idx"])
+        spec = result["spec"]
+        sample = result["sample"]
+        if translator_cfg is None or not translator_cfg.ready:
+            raise RuntimeError("translator config missing")
+        translator_client = OpenAICompatibleClient(translator_cfg)
+        translated = translate_dialogue_sample(
+            sample,
+            translator_client,
+            spec,
+            on_event=lambda msg, **ev: job_log(job_id, msg, item=idx, **ev),
+        )
+        text = conversation_text(translated["messages"])
+        turns = sum(1 for m in translated["messages"] if m.get("role") in {"user", "assistant"})
+        job_log(job_id, f"翻译后样本完成：{turns} 条 user/assistant 消息，开始自动审核", item=idx)
+        judge_client = OpenAICompatibleClient(judge_cfg) if judge_cfg and judge_cfg.ready else None
+        review = review_sample(translated, spec, judge_client=judge_client)
+        job_log(
+            job_id,
+            f"审核完成：status={review.get('status')} overall={float(review.get('overall', 0) or 0):.2f}",
+            item=idx,
+        )
+        return {"idx": idx, "spec": spec, "sample": translated, "review": review, "text": text}
+
+    def record_failure(idx: int, spec: Dict[str, Any], exc: Exception) -> None:
+        err = {"index": str(idx), "error": str(exc), "theme": spec.get("theme", "")}
+        with JOBS_LOCK:
+            job = JOBS.get(job_id)
+            if job:
+                job.setdefault("errors", []).append(err)
+        # completed means "finalized sample count".  If generation succeeded
+        # but the async translation/review stage failed, it still consumed one
+        # requested item, so this is correct for both stages.
+        job_inc(job_id, completed=1, failed=1)
+        job_log(job_id, f"失败：{exc}", level="error", item=idx)
+
     try:
-        with ThreadPoolExecutor(max_workers=req.concurrency) as pool:
-            futures = {
-                pool.submit(
+        # Translation is moved to a separate pool so a long 5k-token translation
+        # request no longer occupies Sydney/source generation slots. This keeps
+        # the design intact but hides translation latency behind later samples.
+        defer_translation = bool(
+            req.translate_to_zh
+            and translator_cfg is not None
+            and translator_cfg.ready
+            and env_bool("ASYNC_TRANSLATION_STAGE", True)
+        )
+        translation_workers = env_int(
+            "TRANSLATION_CONCURRENCY",
+            max(1, min(req.concurrency, 4)),
+            1,
+            64,
+        )
+        with ThreadPoolExecutor(max_workers=req.concurrency) as gen_pool, ThreadPoolExecutor(max_workers=translation_workers) as trans_pool:
+            gen_futures = {
+                gen_pool.submit(
                     generate_and_review_one,
                     job_id=job_id,
                     idx=idx,
@@ -739,70 +859,35 @@ def run_generation_job(
                     judge_cfg=judge_cfg,
                     max_turns=req.max_turns,
                     translate_to_zh=req.translate_to_zh,
+                    defer_translation=defer_translation,
                 ): (idx, spec)
                 for idx, spec in enumerate(specs, start=1)
             }
-            job_update(job_id, queued=len(futures))
+            trans_futures: Dict[Any, tuple[int, Dict[str, Any]]] = {}
+            job_update(job_id, queued=len(gen_futures))
 
-            for future in as_completed(futures):
-                idx, spec = futures[future]
-                try:
-                    result = future.result()
-                    sample = result["sample"]
-                    review = result["review"]
-                    text = result["text"]
+            while gen_futures or trans_futures:
+                done_gen, _ = wait(gen_futures.keys(), timeout=0.2, return_when=FIRST_COMPLETED) if gen_futures else (set(), set())
+                for future in done_gen:
+                    idx, spec = gen_futures.pop(future)
+                    try:
+                        result = future.result()
+                        if result.get("needs_translation"):
+                            tf = trans_pool.submit(translate_and_review_result, result)
+                            trans_futures[tf] = (idx, spec)
+                        else:
+                            finalize_result(result)
+                    except Exception as exc:  # noqa: BLE001
+                        record_failure(idx, spec, exc)
 
-                    is_dup, dup_id, dup_score = find_duplicate(text, existing)
-                    if is_dup:
-                        review = apply_duplicate_penalty(review, dup_id, dup_score)
-                        sample["duplicate_of"] = dup_id
-                        job_log(
-                            job_id,
-                            f"近重复，自动丢弃：duplicate_of={dup_id}, similarity={dup_score:.3f}",
-                            level="warn",
-                            item=idx,
-                        )
-
-                    sample["review"] = review
-                    sample["status"] = review.get("status", "needs_review")
-                    sample["score"] = float(review.get("overall", 0) or 0)
-                    sample["updated_at"] = utc_now()
-                    save_sample(sample)
-                    write_status_mirror(sample)
-
-                    generated.append(
-                        {
-                            "id": sample["id"],
-                            "status": sample["status"],
-                            "score": sample["score"],
-                            "theme": spec.get("theme"),
-                        }
-                    )
-                    existing.append((sample["id"], text))
-
-                    status = sample["status"]
-                    job_inc(
-                        job_id,
-                        completed=1,
-                        generated=1,
-                        accepted=1 if status == "accepted" else 0,
-                        needs_review=1 if status == "needs_review" else 0,
-                        rejected=1 if status == "rejected" else 0,
-                    )
-                    job_log(
-                        job_id,
-                        f"已保存：{sample['id']} | {status} | score={sample['score']:.2f}",
-                        level="ok" if status == "accepted" else "warn" if status == "needs_review" else "error",
-                        item=idx,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    err = {"index": str(idx), "error": str(exc), "theme": spec.get("theme", "")}
-                    with JOBS_LOCK:
-                        job = JOBS.get(job_id)
-                        if job:
-                            job.setdefault("errors", []).append(err)
-                    job_inc(job_id, completed=1, failed=1)
-                    job_log(job_id, f"失败：{exc}", level="error", item=idx)
+                trans_timeout = 0.0 if gen_futures else 0.2
+                done_trans, _ = wait(trans_futures.keys(), timeout=trans_timeout, return_when=FIRST_COMPLETED) if trans_futures else (set(), set())
+                for future in done_trans:
+                    idx, spec = trans_futures.pop(future)
+                    try:
+                        finalize_result(future.result())
+                    except Exception as exc:  # noqa: BLE001
+                        record_failure(idx, spec, exc)
 
         batch_path = None
         if generated:
