@@ -6,14 +6,14 @@
 #   只暴露一个 Cloudflare Tunnel：控制台，不暴露模型端口
 #
 # 用法：
-#   REPO_URL=https://github.com/boooozhang2007/sydney.git bash scripts/deploy_cloud_full_rocm.sh
+#   bash scripts/deploy_cloud_full_rocm.sh
 
 set -Eeuo pipefail
 
 APP_DIR="${APP_DIR:-/workspace/sydney_NEWBING}"
-REPO_URL="${REPO_URL:-}"
+REPO_URL="${REPO_URL:-https://gitee.com/qzonez/sydney.git}"
 GIT_BRANCH="${GIT_BRANCH:-main}"
-GIT_PROXY_PREFIX="${GIT_PROXY_PREFIX:-https://gh.llkk.cc/}"
+GIT_PROXY_PREFIX="${GIT_PROXY_PREFIX:-}"
 # 只加速 GitHub/Hugging Face；apt/pip 保持当前镜像环境默认源。
 HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 
@@ -28,6 +28,7 @@ SYDNEY_CTX_SIZE="${SYDNEY_CTX_SIZE:-262144}"
 SYDNEY_MODEL_LOCAL_FILE="${SYDNEY_MODEL_LOCAL_FILE:-}"
 
 # Qwen FP8 + vLLM 参数。ROCm 上默认保守，优先稳定；要冲吞吐再逐步调高。
+QWEN_MODEL_PROVIDER="${QWEN_MODEL_PROVIDER:-modelscope}"
 QWEN_MS_MODEL_ID="${QWEN_MS_MODEL_ID:-Qwen/Qwen3.6-27B-FP8}"
 QWEN_MODEL_DIR="${QWEN_MODEL_DIR:-/workspace/modelscope/qwen36_27b_fp8}"
 QWEN_SERVED_MODEL_NAME="${QWEN_SERVED_MODEL_NAME:-qwen3.6-27b-fp8}"
@@ -35,16 +36,27 @@ QWEN_GPU_MEMORY_UTILIZATION="${QWEN_GPU_MEMORY_UTILIZATION:-0.40}"
 QWEN_AUTO_MEMORY_UTIL="${QWEN_AUTO_MEMORY_UTIL:-1}"
 QWEN_MAX_MODEL_LEN="${QWEN_MAX_MODEL_LEN:-32768}"
 QWEN_MAX_NUM_SEQS="${QWEN_MAX_NUM_SEQS:-64}"
-QWEN_MAX_NUM_BATCHED_TOKENS="${QWEN_MAX_NUM_BATCHED_TOKENS:-65536}"
+QWEN_MAX_NUM_BATCHED_TOKENS="${QWEN_MAX_NUM_BATCHED_TOKENS:-8192}"
 QWEN_TENSOR_PARALLEL_SIZE="${QWEN_TENSOR_PARALLEL_SIZE:-1}"
 QWEN_DTYPE="${QWEN_DTYPE:-auto}"
 QWEN_TRUST_REMOTE_CODE="${QWEN_TRUST_REMOTE_CODE:-1}"
-QWEN_USE_V1="${QWEN_USE_V1:-0}"
+QWEN_USE_V1="${QWEN_USE_V1:-}"
 QWEN_ENFORCE_EAGER="${QWEN_ENFORCE_EAGER:-1}"
 QWEN_DISABLE_CUDA_GRAPH="${QWEN_DISABLE_CUDA_GRAPH:-1}"
 QWEN_CLEAR_COMPILE_CACHE="${QWEN_CLEAR_COMPILE_CACHE:-1}"
 QWEN_STARTUP_TIMEOUT_SEC="${QWEN_STARTUP_TIMEOUT_SEC:-900}"
 VLLM_EXTRA_ARGS="${VLLM_EXTRA_ARGS:-}"
+# ROCm/vLLM 0.20.x 对 Qwen3.6 的 GDN/aiter/chunked prefill 组合比较敏感。
+# safe-mode 保持 max-num-seqs=64，但降低单次 batched tokens，并关闭容易触发 HIP illegal access 的启动路径。
+QWEN_ROCM_SAFE_MODE="${QWEN_ROCM_SAFE_MODE:-1}"
+QWEN_SAFE_MAX_NUM_BATCHED_TOKENS="${QWEN_SAFE_MAX_NUM_BATCHED_TOKENS:-8192}"
+QWEN_LANGUAGE_MODEL_ONLY="${QWEN_LANGUAGE_MODEL_ONLY:-1}"
+QWEN_ENABLE_CHUNKED_PREFILL="${QWEN_ENABLE_CHUNKED_PREFILL:-0}"
+QWEN_ASYNC_SCHEDULING="${QWEN_ASYNC_SCHEDULING:-0}"
+QWEN_DISABLE_ASYNC_OUTPUT_PROC="${QWEN_DISABLE_ASYNC_OUTPUT_PROC:-1}"
+QWEN_PATCH_GDN_WARMUP="${QWEN_PATCH_GDN_WARMUP:-1}"
+QWEN_USE_AITER="${QWEN_USE_AITER:-0}"
+QWEN_REASONING_PARSER="${QWEN_REASONING_PARSER:-}"
 SKIP_VLLM_CHECK="${SKIP_VLLM_CHECK:-0}"
 
 LLAMA_DIR="${LLAMA_DIR:-/workspace/llama.cpp-rocm}"
@@ -104,11 +116,15 @@ clone_or_update_repo(){
   if [[ -f "$APP_DIR/app.py" ]]; then
     log "源码已存在：$APP_DIR"
     cd "$APP_DIR"
+    if [[ -n "$REPO_URL" && -d .git ]]; then
+      log "设置源码 origin：$REPO_URL"
+      git remote set-url origin "$REPO_URL" || true
+    fi
     git pull --ff-only || warn "git pull 失败，继续使用本地源码"
     return 0
   fi
   if [[ -z "$REPO_URL" ]]; then
-    err "APP_DIR 不存在且 REPO_URL 未设置。请设置 REPO_URL=https://github.com/xxx/sydney_NEWBING.git"
+    err "APP_DIR 不存在且 REPO_URL 未设置。请设置 REPO_URL=https://gitee.com/qzonez/sydney.git 或你的仓库地址"
     exit 1
   fi
   mkdir -p "$(dirname "$APP_DIR")"
@@ -130,6 +146,7 @@ modelscope_download_qwen_fp8(){
     log "Qwen FP8 已存在：$QWEN_MODEL_DIR"
     return 0
   fi
+  log "Qwen 模型下载 provider=$QWEN_MODEL_PROVIDER（默认/优先 ModelScope）"
   log "用 ModelScope 下载 Qwen FP8：$QWEN_MS_MODEL_ID -> $QWEN_MODEL_DIR"
   QWEN_MS_MODEL_ID="$QWEN_MS_MODEL_ID" QWEN_MODEL_DIR="$QWEN_MODEL_DIR" python3 - <<'PY'
 import os
@@ -213,6 +230,109 @@ refresh_vllm_help(){
 }
 vllm_supports(){ local flag="$1"; refresh_vllm_help; grep -q -- "$flag" "$(vllm_help_file)" 2>/dev/null; }
 
+vllm_envs_file(){ echo "$RUN_DIR/vllm-envs.list"; }
+refresh_vllm_envs(){
+  local ef; ef="$(vllm_envs_file)"
+  [[ -s "$ef" && "${VLLM_REFRESH_ENVS:-0}" != "1" ]] && return 0
+  python3 - <<'PY' > "$ef" 2>/dev/null || true
+try:
+    import vllm.envs as envs
+    names = set()
+    for obj_name in ('environment_variables', 'ENV_VARS'):
+        obj = getattr(envs, obj_name, None)
+        if isinstance(obj, dict):
+            names.update(str(k) for k in obj.keys())
+    names.update(n for n in dir(envs) if n.isupper())
+    for n in sorted(names):
+        print(n)
+except Exception:
+    pass
+PY
+}
+vllm_env_known(){ local name="$1"; refresh_vllm_envs; grep -qx -- "$name" "$(vllm_envs_file)" 2>/dev/null; }
+export_vllm_env_if_known(){
+  local name="$1" default_value="$2"
+  if vllm_env_known "$name"; then
+    if [[ -z "${!name+x}" ]]; then export "$name=$default_value"; else export "$name=${!name}"; fi
+  else
+    [[ "${3:-0}" == "1" ]] && warn "当前 vLLM 不识别环境变量 $name，已跳过，避免 unknown env 警告。"
+  fi
+}
+append_vllm_switch(){ local arr_name="$1" flag="$2"; local -n _arr="$arr_name"; if vllm_supports "$flag"; then _arr+=("$flag"); else [[ "${3:-0}" == "1" ]] && warn "当前 vLLM 不支持参数 $flag，已跳过。"; fi; }
+append_vllm_option(){ local arr_name="$1" flag="$2" value="$3"; local -n _arr="$arr_name"; if vllm_supports "$flag"; then _arr+=("$flag" "$value"); else [[ "${4:-0}" == "1" ]] && warn "当前 vLLM 不支持参数 $flag，已跳过。"; fi; }
+append_vllm_disable_bool(){
+  local arr_name="$1" flag="$2"; local -n _arr="$arr_name"
+  local no_flag="--no-${flag#--}"
+  local disable_flag="$flag"
+  if [[ "$flag" == --enable-* ]]; then disable_flag="--disable-${flag#--enable-}"; fi
+  if vllm_supports "$no_flag"; then _arr+=("$no_flag"); elif [[ "$disable_flag" != "$flag" ]] && vllm_supports "$disable_flag"; then _arr+=("$disable_flag"); else [[ "${3:-0}" == "1" ]] && warn "当前 vLLM 未暴露关闭 $flag 的 CLI 参数，已跳过。"; fi
+}
+apply_qwen_rocm_safe_defaults(){
+  [[ "$QWEN_ROCM_SAFE_MODE" == "1" ]] || return 0
+  if [[ "$QWEN_MAX_NUM_BATCHED_TOKENS" =~ ^[0-9]+$ && "$QWEN_SAFE_MAX_NUM_BATCHED_TOKENS" =~ ^[0-9]+$ && "$QWEN_MAX_NUM_BATCHED_TOKENS" -gt "$QWEN_SAFE_MAX_NUM_BATCHED_TOKENS" ]]; then
+    warn "ROCm safe-mode: QWEN_MAX_NUM_BATCHED_TOKENS $QWEN_MAX_NUM_BATCHED_TOKENS -> $QWEN_SAFE_MAX_NUM_BATCHED_TOKENS（并发 seqs 仍为 $QWEN_MAX_NUM_SEQS）"
+    QWEN_MAX_NUM_BATCHED_TOKENS="$QWEN_SAFE_MAX_NUM_BATCHED_TOKENS"
+  fi
+}
+prepare_qwen_gdn_patch(){
+  [[ "$QWEN_PATCH_GDN_WARMUP" == "1" ]] || return 0
+  local patch_dir="$STACK_DIR/vllm_patches"
+  mkdir -p "$patch_dir"
+  cat > "$patch_dir/sitecustomize.py" <<'PY'
+import builtins
+import os
+import sys
+_TARGETS = ("vllm.model_executor.layers.mamba.gdn_linear_attn", "vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn")
+def _noop_warmup(self, *args, **kwargs):
+    return None
+def _patch_module(mod):
+    if mod is None or getattr(mod, "_sydney_rocm_gdn_warmup_patch", False):
+        return
+    patched = 0
+    for _, obj in list(vars(mod).items()):
+        if isinstance(obj, type):
+            for attr in list(vars(obj).keys()):
+                if attr.startswith("_warmup") and "kernel" in attr:
+                    try:
+                        setattr(obj, attr, _noop_warmup); patched += 1
+                    except Exception:
+                        pass
+    if patched:
+        setattr(mod, "_sydney_rocm_gdn_warmup_patch", True)
+        try: sys.stderr.write(f"[sydney-vllm-patch] disabled {patched} GDN warmup kernel method(s) in {mod.__name__}\n")
+        except Exception: pass
+def _patch_loaded():
+    for name in _TARGETS: _patch_module(sys.modules.get(name))
+if os.environ.get("VLLM_QWEN_GDN_DISABLE_WARMUP") == "1":
+    _orig_import = builtins.__import__
+    def _import_hook(name, globals=None, locals=None, fromlist=(), level=0):
+        mod = _orig_import(name, globals, locals, fromlist, level)
+        if "gdn" in name or "mamba" in name or name.startswith("vllm"):
+            _patch_loaded()
+        return mod
+    builtins.__import__ = _import_hook
+    _patch_loaded()
+PY
+  export VLLM_QWEN_GDN_DISABLE_WARMUP=1
+  case ":${PYTHONPATH:-}:" in *:"$patch_dir":*) ;; *) export PYTHONPATH="$patch_dir${PYTHONPATH:+:$PYTHONPATH}" ;; esac
+  log "ROCm safe-mode: 已启用 Qwen GDN warmup runtime patch，可用 QWEN_PATCH_GDN_WARMUP=0 关闭。"
+}
+apply_qwen_vllm_envs(){
+  export HF_ENDPOINT="$HF_ENDPOINT"
+  export VLLM_USE_MODELSCOPE="True"
+  export PYTORCH_HIP_ALLOC_CONF="${PYTORCH_HIP_ALLOC_CONF:-expandable_segments:True}"
+  export RCCL_MSCCL_ENABLE="${RCCL_MSCCL_ENABLE:-0}"
+  if [[ -n "$QWEN_USE_V1" ]]; then export_vllm_env_if_known VLLM_USE_V1 "$QWEN_USE_V1" 1; fi
+  if [[ "$QWEN_ROCM_SAFE_MODE" == "1" ]]; then
+    export_vllm_env_if_known VLLM_ROCM_USE_AITER "$QWEN_USE_AITER" 0
+    export_vllm_env_if_known VLLM_ROCM_USE_AITER_LINEAR "$QWEN_USE_AITER" 0
+    export_vllm_env_if_known VLLM_ROCM_USE_AITER_MOE "$QWEN_USE_AITER" 0
+    export_vllm_env_if_known VLLM_ROCM_USE_AITER_RMSNORM "$QWEN_USE_AITER" 0
+    export_vllm_env_if_known VLLM_ROCM_USE_AITER_PAGED_ATTN "$QWEN_USE_AITER" 0
+    prepare_qwen_gdn_patch
+  fi
+}
+
 start_qwen_vllm(){
   modelscope_download_qwen_fp8
   if [[ -f "$RUN_DIR/qwen-vllm.pid" ]] && ! kill -0 "$(cat "$RUN_DIR/qwen-vllm.pid")" 2>/dev/null; then
@@ -229,11 +349,8 @@ start_qwen_vllm(){
   effective_gpu_util="$(detect_qwen_gpu_memory_utilization)"
   log "启动 Qwen3.6-27B-FP8 vLLM：127.0.0.1:$QWEN_PORT"
   log "model=$QWEN_MODEL_DIR max_model_len=$QWEN_MAX_MODEL_LEN max_num_seqs=$QWEN_MAX_NUM_SEQS gpu_memory_utilization=$effective_gpu_util"
-  export HF_ENDPOINT="$HF_ENDPOINT"
-  export VLLM_USE_MODELSCOPE="True"
-  export VLLM_USE_V1="$QWEN_USE_V1"
-  export PYTORCH_HIP_ALLOC_CONF="${PYTORCH_HIP_ALLOC_CONF:-expandable_segments:True}"
-  export RCCL_MSCCL_ENABLE="${RCCL_MSCCL_ENABLE:-0}"
+  apply_qwen_rocm_safe_defaults
+  apply_qwen_vllm_envs
   local vllm_args=(
     --host 127.0.0.1
     --port "$QWEN_PORT"
@@ -246,13 +363,18 @@ start_qwen_vllm(){
     --max-num-seqs "$QWEN_MAX_NUM_SEQS"
     --max-num-batched-tokens "$QWEN_MAX_NUM_BATCHED_TOKENS"
   )
-  [[ "$QWEN_TRUST_REMOTE_CODE" == "1" ]] && vllm_supports "--trust-remote-code" && vllm_args+=(--trust-remote-code)
-  [[ "$QWEN_ENFORCE_EAGER" == "1" ]] && vllm_supports "--enforce-eager" && vllm_args+=(--enforce-eager)
+  [[ "$QWEN_TRUST_REMOTE_CODE" == "1" ]] && append_vllm_switch vllm_args "--trust-remote-code"
+  [[ "$QWEN_ENFORCE_EAGER" == "1" ]] && append_vllm_switch vllm_args "--enforce-eager"
+  [[ "$QWEN_LANGUAGE_MODEL_ONLY" == "1" ]] && append_vllm_switch vllm_args "--language-model-only"
+  [[ -n "$QWEN_REASONING_PARSER" ]] && append_vllm_option vllm_args "--reasoning-parser" "$QWEN_REASONING_PARSER"
+  [[ "$QWEN_ENABLE_CHUNKED_PREFILL" == "0" ]] && append_vllm_disable_bool vllm_args "--enable-chunked-prefill" 1
+  [[ "$QWEN_ASYNC_SCHEDULING" == "0" ]] && append_vllm_disable_bool vllm_args "--async-scheduling" 0
+  [[ "$QWEN_DISABLE_ASYNC_OUTPUT_PROC" == "1" ]] && append_vllm_switch vllm_args "--disable-async-output-proc"
   if [[ "$QWEN_DISABLE_CUDA_GRAPH" == "1" ]]; then
     if vllm_supports "--disable-cudagraph"; then
       vllm_args+=(--disable-cudagraph)
     else
-      warn "当前 vLLM 无 --disable-cudagraph；已依赖 --enforce-eager/VLLM_USE_V1=$QWEN_USE_V1 降低 ROCm cudagraph 风险。"
+      warn "当前 vLLM 无 --disable-cudagraph；已使用 --enforce-eager 并跳过 VLLM_USE_V1 unknown env。"
     fi
   fi
   if [[ -n "$VLLM_EXTRA_ARGS" ]]; then

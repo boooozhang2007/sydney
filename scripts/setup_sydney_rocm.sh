@@ -57,8 +57,8 @@ MODEL_PROVIDER="${MODEL_PROVIDER:-auto}" # auto / hf / modelscope
 MODELSCOPE_MODEL_ID="${MODELSCOPE_MODEL_ID:-}"
 MODELSCOPE_FILE_PATH="${MODELSCOPE_FILE_PATH:-$MODEL_NAME}"
 MODELSCOPE_REVISION="${MODELSCOPE_REVISION:-master}"
-# GitHub 加速只用于克隆 llama.cpp；不改 apt/pip 等其他源。
-GITHUB_PROXY_PREFIX="${GITHUB_PROXY_PREFIX:-https://gh.llkk.cc/}"
+# GitHub 加速只用于克隆 llama.cpp；默认不加速，避免影响 Gitee/直连。
+GITHUB_PROXY_PREFIX="${GITHUB_PROXY_PREFIX:-}"
 LLAMA_CPP_REPO="${LLAMA_CPP_REPO:-https://github.com/ggml-org/llama.cpp.git}"
 MODEL_URL="${MODEL_URL:-$HF_ENDPOINT/$HF_REPO_ID/resolve/main/$MODEL_NAME}"
 # 备用源会按顺序尝试。国内环境默认优先 hf-mirror，失败后再试 Hugging Face 官方。
