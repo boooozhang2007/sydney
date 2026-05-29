@@ -57,9 +57,9 @@ MODEL_PROVIDER="${MODEL_PROVIDER:-auto}" # auto / hf / modelscope
 MODELSCOPE_MODEL_ID="${MODELSCOPE_MODEL_ID:-}"
 MODELSCOPE_FILE_PATH="${MODELSCOPE_FILE_PATH:-$MODEL_NAME}"
 MODELSCOPE_REVISION="${MODELSCOPE_REVISION:-master}"
-# GitHub 加速只用于克隆 llama.cpp；默认不加速，避免影响 Gitee/直连。
+# GitHub 加速只用于克隆 GitHub 源；默认 llama.cpp 使用 GitCode 镜像，避免 GitHub TLS/断流问题。
 GITHUB_PROXY_PREFIX="${GITHUB_PROXY_PREFIX:-}"
-LLAMA_CPP_REPO="${LLAMA_CPP_REPO:-https://github.com/ggml-org/llama.cpp.git}"
+LLAMA_CPP_REPO="${LLAMA_CPP_REPO:-https://gitcode.com/GitHub_Trending/ll/llama.cpp.git}"
 MODEL_URL="${MODEL_URL:-$HF_ENDPOINT/$HF_REPO_ID/resolve/main/$MODEL_NAME}"
 # 备用源会按顺序尝试。国内环境默认优先 hf-mirror，失败后再试 Hugging Face 官方。
 MODEL_URL_FALLBACKS="${MODEL_URL_FALLBACKS:-$MODEL_URL https://huggingface.co/$HF_REPO_ID/resolve/main/$MODEL_NAME}"
@@ -231,7 +231,7 @@ clone_or_update_llama_cpp() {
   fi
 
   local urls=()
-  if [[ -n "$GITHUB_PROXY_PREFIX" ]]; then
+  if [[ -n "$GITHUB_PROXY_PREFIX" && "$LLAMA_CPP_REPO" == *github.com/* ]]; then
     urls+=("${GITHUB_PROXY_PREFIX}${LLAMA_CPP_REPO}")
   fi
   urls+=("$LLAMA_CPP_REPO")
@@ -294,6 +294,32 @@ model_file_ok() {
   [[ "$size" -gt 1000000000 ]]
 }
 
+remove_tiny_model_file_if_any() {
+  [[ -f "$MODEL_PATH" ]] || return 0
+  local size
+  size="$(stat -c '%s' "$MODEL_PATH" 2>/dev/null || echo 0)"
+  # curl 在无 -f 时可能把 404/HTML/Xet 错误页保存成同名小文件；断点续传前先清掉。
+  if [[ "$size" -gt 0 && "$size" -lt 1000000 ]]; then
+    warn "删除疑似错误页/残缺小文件：$MODEL_PATH ($(awk "BEGIN {printf \"%.2f\", $size/1000}") KB)"
+    rm -f "$MODEL_PATH"
+  fi
+}
+
+adopt_downloaded_model_from_dir() {
+  if model_file_ok; then
+    return 0
+  fi
+  local found=""
+  found="$(find "$MODEL_DIR" -type f -name "$MODEL_NAME" -size +1000000000c 2>/dev/null | head -n 1 || true)"
+  [[ -n "$found" ]] || return 1
+  if [[ "$(readlink -f "$found")" != "$(readlink -f "$MODEL_PATH" 2>/dev/null || echo "$MODEL_PATH")" ]]; then
+    mkdir -p "$MODEL_DIR"
+    log "发现下载完成的模型文件，复制到运行路径：$found -> $MODEL_PATH"
+    cp -f "$found" "$MODEL_PATH"
+  fi
+  model_file_ok
+}
+
 print_download_progress_hint() {
   local size="0"
   if [[ -f "$MODEL_PATH" ]]; then
@@ -303,12 +329,25 @@ print_download_progress_hint() {
 }
 
 download_with_hf_cli() {
-  if ! have_cmd huggingface-cli; then
+  local hf_bin=""
+  if have_cmd hf; then
+    hf_bin="hf"
+  elif have_cmd huggingface-cli; then
+    hf_bin="huggingface-cli"
+  else
     return 1
   fi
-  log "尝试 huggingface-cli 下载，HF_ENDPOINT=$HF_ENDPOINT"
-  HF_ENDPOINT="$HF_ENDPOINT" huggingface-cli download "$HF_REPO_ID" "$MODEL_NAME" \
-    --local-dir "$MODEL_DIR" --local-dir-use-symlinks False
+
+  remove_tiny_model_file_if_any
+  log "尝试 $hf_bin 下载，HF_ENDPOINT=$HF_ENDPOINT"
+  if [[ "$hf_bin" == "hf" ]]; then
+    HF_ENDPOINT="$HF_ENDPOINT" HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-0}" HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}" \
+      hf download "$HF_REPO_ID" "$MODEL_NAME" --local-dir "$MODEL_DIR"
+  else
+    HF_ENDPOINT="$HF_ENDPOINT" HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-0}" HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}" \
+      huggingface-cli download "$HF_REPO_ID" "$MODEL_NAME" --local-dir "$MODEL_DIR" --local-dir-use-symlinks False
+  fi
+  adopt_downloaded_model_from_dir
 }
 
 download_with_modelscope_cli() {
@@ -399,14 +438,16 @@ PY
 download_with_aria2_or_curl() {
   local url="$1"
   log "尝试下载源：$url"
+  remove_tiny_model_file_if_any
   print_download_progress_hint
   if have_cmd aria2c; then
     # aria2c 对国内镜像/大文件断点续传更稳。
     aria2c -x 16 -s 16 -k 1M -c \
       --retry-wait=5 --max-tries=20 --timeout=60 --connect-timeout=30 \
+      --allow-overwrite=true --auto-file-renaming=false \
       -d "$MODEL_DIR" -o "$MODEL_NAME" "$url"
   elif have_cmd curl; then
-    curl -L --retry 20 --retry-delay 5 --connect-timeout 30 --speed-time 120 --speed-limit 1024 \
+    curl -fL --retry 20 --retry-delay 5 --connect-timeout 30 --speed-time 120 --speed-limit 1024 \
       -C - -o "$MODEL_PATH" "$url"
   elif have_cmd wget; then
     wget -c --tries=20 --timeout=60 -O "$MODEL_PATH" "$url"
@@ -510,7 +551,7 @@ download_model() {
   if [[ "$MODEL_PROVIDER" == "hf" || "$MODEL_PROVIDER" == "auto" ]]; then
     # 再尝试 HF CLI + hf-mirror。失败不退出，继续 aria2/curl 直链。
     if ! model_file_ok; then
-      download_with_hf_cli || warn "huggingface-cli 下载失败或不可用，切换到直链断点下载。"
+      download_with_hf_cli || warn "HF CLI 下载失败或不可用，切换到直链断点下载。"
     fi
   fi
 
