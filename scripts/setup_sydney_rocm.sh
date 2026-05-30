@@ -672,7 +672,9 @@ else
     --repeat-penalty "\$REPEAT_PENALTY"
   )
   if [[ "\$LLAMA_FLASH_ATTN" == "1" ]]; then
-    args+=(--flash-attn)
+    args+=(--flash-attn on)
+  elif [[ "\$LLAMA_FLASH_ATTN" == "0" ]]; then
+    args+=(--flash-attn off)
   fi
   if [[ -n "\$KV_CACHE_TYPE_K" ]]; then
     args+=(--cache-type-k "\$KV_CACHE_TYPE_K")
