@@ -30,9 +30,12 @@
 #   MODEL_LOCAL_SEARCH_DIRS=/mnt /mnt/data /workspace /root
 #   SERVED_MODEL_NAME=clever-sydney-4-12b-q8
 #   PORT=8000
-#   CTX_SIZE=32768   # llama.cpp server 常把 ctx 作为总上下文；PARALLEL=8 时约等于每 slot 4096
+#   CTX_SIZE=131072  # llama.cpp 总上下文；PARALLEL=32 时约每 slot 4096
 #   GPU_LAYERS=999
-#   PARALLEL=8
+#   PARALLEL=32      # 并发 slot 数；显存够可拉到 64
+#   LLAMA_FLASH_ATTN=1
+#   KV_CACHE_TYPE_K=q8_0
+#   KV_CACHE_TYPE_V=q8_0
 #   TEMP=0.82
 #   TOP_P=0.94
 #   REPEAT_PENALTY=1.16
@@ -75,14 +78,19 @@ SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-clever-sydney-4-12b-q8}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
 # 对 llama.cpp server，较稳的经验是 CTX_SIZE ≈ PARALLEL × 单 slot 目标上下文。
-# 默认 PARALLEL=8 时给总 ctx 32768，约每 slot 4096；若 OOM 可降到 16384/8192。
-CTX_SIZE="${CTX_SIZE:-32768}"
+# 默认 PARALLEL=32 时给总 ctx 131072，约每 slot 4096；OOM 时降低 CTX_SIZE 或 PARALLEL。
+CTX_SIZE="${CTX_SIZE:-131072}"
 GPU_LAYERS="${GPU_LAYERS:-999}"
-# llama.cpp server 的 --parallel 表示并行 slot 数。显存 192GB 这类 AMD 环境可先用 8。
-# 注意 KV cache 主要随 CTX_SIZE 增长；如果 OOM 就降低 CTX_SIZE 或 PARALLEL。
-PARALLEL="${PARALLEL:-8}"
-BATCH_SIZE="${BATCH_SIZE:-512}"
+# llama.cpp server 的 --parallel 表示并行 slot 数。192GB 这类 AMD 环境可上 32~64。
+# KV cache 主要随 CTX_SIZE 增长；如果 OOM 就降低 CTX_SIZE 或 PARALLEL。
+PARALLEL="${PARALLEL:-32}"
+# 大 batch 让 prefill 更快；ubatch 也跟上避免分多次 launch。
+BATCH_SIZE="${BATCH_SIZE:-2048}"
 UBATCH_SIZE="${UBATCH_SIZE:-512}"
+# Flash attention + KV 量化：高吞吐档默认全开，显存占用减半再多。
+LLAMA_FLASH_ATTN="${LLAMA_FLASH_ATTN:-1}"
+KV_CACHE_TYPE_K="${KV_CACHE_TYPE_K:-q8_0}"
+KV_CACHE_TYPE_V="${KV_CACHE_TYPE_V:-q8_0}"
 TEMP="${TEMP:-0.82}"
 TOP_P="${TOP_P:-0.94}"
 REPEAT_PENALTY="${REPEAT_PENALTY:-1.16}"
@@ -93,8 +101,8 @@ LLAMA_EXTRA_ARGS="${LLAMA_EXTRA_ARGS:-}"
 FORCE_REBUILD="${FORCE_REBUILD:-0}"
 USE_TUNNEL="${USE_TUNNEL:-0}"
 # cloudflared 下载在国内经常卡住；默认给多个镜像源和短超时。
-CLOUDFLARED_URL="${CLOUDFLARED_URL:-https://gh.llkk.cc/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64}"
-CLOUDFLARED_URL_FALLBACKS="${CLOUDFLARED_URL_FALLBACKS:-$CLOUDFLARED_URL https://ghproxy.net/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64}"
+CLOUDFLARED_URL="${CLOUDFLARED_URL:-https://ghfast.top/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64}"
+CLOUDFLARED_URL_FALLBACKS="${CLOUDFLARED_URL_FALLBACKS:-$CLOUDFLARED_URL https://gh.llkk.cc/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 https://ghproxy.net/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64}"
 # 如果你已手动把 cloudflared 上传到 /mnt，脚本会优先复制这个文件。
 CLOUDFLARED_LOCAL_PATH="${CLOUDFLARED_LOCAL_PATH:-/mnt/cloudflared}"
 START_AFTER_SETUP="0"
@@ -621,6 +629,9 @@ GPU_LAYERS="\${GPU_LAYERS:-$GPU_LAYERS}"
 PARALLEL="\${PARALLEL:-$PARALLEL}"
 BATCH_SIZE="\${BATCH_SIZE:-$BATCH_SIZE}"
 UBATCH_SIZE="\${UBATCH_SIZE:-$UBATCH_SIZE}"
+LLAMA_FLASH_ATTN="\${LLAMA_FLASH_ATTN:-$LLAMA_FLASH_ATTN}"
+KV_CACHE_TYPE_K="\${KV_CACHE_TYPE_K:-$KV_CACHE_TYPE_K}"
+KV_CACHE_TYPE_V="\${KV_CACHE_TYPE_V:-$KV_CACHE_TYPE_V}"
 TEMP="\${TEMP:-$TEMP}"
 TOP_P="\${TOP_P:-$TOP_P}"
 REPEAT_PENALTY="\${REPEAT_PENALTY:-$REPEAT_PENALTY}"
@@ -660,6 +671,15 @@ else
     --top-p "\$TOP_P"
     --repeat-penalty "\$REPEAT_PENALTY"
   )
+  if [[ "\$LLAMA_FLASH_ATTN" == "1" ]]; then
+    args+=(--flash-attn)
+  fi
+  if [[ -n "\$KV_CACHE_TYPE_K" ]]; then
+    args+=(--cache-type-k "\$KV_CACHE_TYPE_K")
+  fi
+  if [[ -n "\$KV_CACHE_TYPE_V" ]]; then
+    args+=(--cache-type-v "\$KV_CACHE_TYPE_V")
+  fi
   if [[ -n "\$LLAMA_ARG_FIT" ]]; then
     args+=(-fit "\$LLAMA_ARG_FIT")
   fi
@@ -724,11 +744,16 @@ if [[ "\$USE_TUNNEL" == "1" ]]; then
       rm -f "\$CLOUDFLARED_BIN.tmp"
       if curl -L --retry 3 --retry-delay 3 --connect-timeout 20 --max-time 180 --speed-time 30 --speed-limit 1024 \
         -o "\$CLOUDFLARED_BIN.tmp" "\$u"; then
-        if [[ -s "\$CLOUDFLARED_BIN.tmp" ]]; then
+        # cloudflared 真二进制 ~37MB; 镜像源失败时常返回几十字节的错误页. 至少 1MB + ELF magic.
+        sz="\$(stat -c '%s' "\$CLOUDFLARED_BIN.tmp" 2>/dev/null || echo 0)"
+        if [[ "\$sz" -gt 1000000 ]] && head -c 4 "\$CLOUDFLARED_BIN.tmp" | grep -q $'\x7fELF'; then
           mv "\$CLOUDFLARED_BIN.tmp" "\$CLOUDFLARED_BIN"
           chmod +x "\$CLOUDFLARED_BIN"
           downloaded="1"
           break
+        else
+          echo "cloudflared 源损坏 (size=\$sz, 非 ELF): \$u"
+          rm -f "\$CLOUDFLARED_BIN.tmp"
         fi
       fi
       echo "cloudflared 源失败: \$u"
@@ -770,6 +795,10 @@ echo "TEACHER_MODEL=\$SERVED_MODEL_NAME"
 echo "TEACHER_API_PROTOCOL=legacy_chat_completions"
 echo "SOURCE_PROMPT_MODE=legacy_chat"
 echo "SOURCE_USE_DEFAULT_STOPS=false"
+echo "# HTTP 池/并发配套，建议与 --parallel 对齐"
+echo "HTTP_POOL_CONNECTIONS=\$PARALLEL"
+echo "HTTP_MAX_CONNECTIONS=\$(( PARALLEL * 2 ))"
+echo "TRANSLATION_CONCURRENCY=\$PARALLEL"
 EOF
 
   cat > "$stop_script" <<EOF
@@ -849,6 +878,9 @@ print_env_hint() {
   TEACHER_API_PROTOCOL=legacy_chat_completions
   SOURCE_PROMPT_MODE=legacy_chat
   SOURCE_USE_DEFAULT_STOPS=false
+  HTTP_POOL_CONNECTIONS=$PARALLEL
+  HTTP_MAX_CONNECTIONS=$(( PARALLEL * 2 ))
+  TRANSLATION_CONCURRENCY=$PARALLEL
 
 如果使用 --tunnel，启动脚本会打印：
   TEACHER_BASE_URL=https://xxxx.trycloudflare.com/v1

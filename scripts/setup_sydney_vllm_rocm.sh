@@ -76,8 +76,8 @@ SYDNEY_VLLM_AUTO_WRITE_CHAT_TEMPLATE="${SYDNEY_VLLM_AUTO_WRITE_CHAT_TEMPLATE:-1}
 # Cloudflare Tunnel 同 setup_sydney_rocm.sh
 USE_TUNNEL="${USE_TUNNEL:-0}"
 CLOUDFLARED_LOCAL_PATH="${CLOUDFLARED_LOCAL_PATH:-/mnt/cloudflared}"
-CLOUDFLARED_URL="${CLOUDFLARED_URL:-https://gh.llkk.cc/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64}"
-CLOUDFLARED_URL_FALLBACKS="${CLOUDFLARED_URL_FALLBACKS:-$CLOUDFLARED_URL https://ghproxy.net/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64}"
+CLOUDFLARED_URL="${CLOUDFLARED_URL:-https://ghfast.top/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64}"
+CLOUDFLARED_URL_FALLBACKS="${CLOUDFLARED_URL_FALLBACKS:-$CLOUDFLARED_URL https://gh.llkk.cc/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 https://ghproxy.net/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64}"
 
 START_AFTER_SETUP="0"; STOP_AFTER_SETUP="0"; RESTART_AFTER_SETUP="0"; STATUS_ONLY="0"
 
@@ -323,7 +323,12 @@ ensure_cloudflared(){
   for url in $CLOUDFLARED_URL_FALLBACKS; do
     log "下载 cloudflared: $url"
     if curl -fsSL --connect-timeout 15 --max-time 600 -o "$bin.tmp" "$url"; then
-      mv "$bin.tmp" "$bin"; chmod +x "$bin"; printf '%s' "$bin"; return 0
+      # 真二进制 ~37MB; 镜像源损坏时常返回几十字节的错误页. 至少 1MB + ELF magic.
+      sz="$(stat -c '%s' "$bin.tmp" 2>/dev/null || echo 0)"
+      if [[ "$sz" -gt 1000000 ]] && head -c 4 "$bin.tmp" | grep -q $'\x7fELF'; then
+        mv "$bin.tmp" "$bin"; chmod +x "$bin"; printf '%s' "$bin"; return 0
+      fi
+      warn "cloudflared 源损坏 (size=$sz, 非 ELF): $url"
     fi
     rm -f "$bin.tmp"
   done

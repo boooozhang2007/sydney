@@ -92,8 +92,8 @@ APP_CONCURRENCY="${APP_CONCURRENCY:-64}"
 USE_TUNNEL="${USE_TUNNEL:-1}"
 KILL_PORT_FALLBACK="${KILL_PORT_FALLBACK:-1}"
 CLOUDFLARED_LOCAL_PATH="${CLOUDFLARED_LOCAL_PATH:-/mnt/cloudflared}"
-CLOUDFLARED_URL="${CLOUDFLARED_URL:-https://gh.llkk.cc/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64}"
-CLOUDFLARED_URL_FALLBACKS="${CLOUDFLARED_URL_FALLBACKS:-$CLOUDFLARED_URL https://ghproxy.net/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64}"
+CLOUDFLARED_URL="${CLOUDFLARED_URL:-https://ghfast.top/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64}"
+CLOUDFLARED_URL_FALLBACKS="${CLOUDFLARED_URL_FALLBACKS:-$CLOUDFLARED_URL https://gh.llkk.cc/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 https://ghproxy.net/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64}"
 
 CMD="start"
 while [[ $# -gt 0 ]]; do
@@ -553,7 +553,13 @@ ensure_cloudflared(){
   for u in $CLOUDFLARED_URL_FALLBACKS; do
     log "下载 cloudflared: $u" >&2
     if curl -L --retry 3 --retry-delay 3 --connect-timeout 20 --max-time 180 --speed-time 30 --speed-limit 1024 -o "$bin.tmp" "$u"; then
-      mv "$bin.tmp" "$bin" && chmod +x "$bin" && echo "$bin" && return 0
+      # 真二进制 ~37MB; 镜像源损坏时常返回几十字节错误页. 至少 1MB + ELF magic.
+      sz="$(stat -c '%s' "$bin.tmp" 2>/dev/null || echo 0)"
+      if [[ "$sz" -gt 1000000 ]] && head -c 4 "$bin.tmp" | grep -q $'\x7fELF'; then
+        mv "$bin.tmp" "$bin" && chmod +x "$bin" && echo "$bin" && return 0
+      fi
+      warn "cloudflared 源损坏 (size=$sz, 非 ELF): $u"
+      rm -f "$bin.tmp"
     fi
   done
   err "cloudflared 下载失败。可上传到 $CLOUDFLARED_LOCAL_PATH 或设置 CLOUDFLARED_URL。"
