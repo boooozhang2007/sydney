@@ -3,11 +3,7 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
-data/workspace.sqlite
-data/raw/*
-data/reviewed/*
-data/rejected/*
-data/exports/*
+data/*
 !data/raw/.gitkeep
 !data/reviewed/.gitkeep
 !data/rejected/.gitkeep
