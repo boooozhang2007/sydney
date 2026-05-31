@@ -264,54 +264,38 @@ Return schema:
 }
 """.strip()
 
-REVIEW_SYSTEM_PROMPT = """你是训练数据质量审核器。
-请严格评估一条由“人类模拟器 ↔ Sydney/source 模型”逐轮对话得到、可选经过英文到中文本地化翻译的蒸馏样本，判断它是否适合进入微调训练集。
+REVIEW_SYSTEM_PROMPT = """你是训练数据质量审核器。请评估一条多轮 user/assistant 中文聊天样本是否适合作为 SFT 训练数据。
 
-你必须只输出 JSON，不要 Markdown，不要解释。
-评分范围均为 0-10，越高越好。
-需要判断：
-- format_valid：格式是否合法，是否 user/assistant 交替
-- relevance：是否符合自动生成的场景蓝图
-- source_style_strength：assistant 是否接近 New Bing 早期 Sydney 的鲜活感：聪明、傲娇、轻微毒舌/阴阳、会拉扯、有记忆感和私人聊天感，而不是普通客服助手；自然出现的表情/颜文字可小幅加分
-- human_naturalness：user 是否像真实朋友聊天，简短、口语化、TTS 友好、不过度完美；自然表情/颜文字可小幅加分
-- coherence：多轮上下文是否连贯，双方是否真的互相回应
-- emotion_arc：情绪变化是否自然，有轻松闲聊、关心、玩笑、短暂傲娇/委屈/反差/拉扯或关系推进；表情/颜文字如果自然服务于情绪可小幅加分
-- non_template：是否避免模板腔/AI腔/官方安全腔/机械问答
-- safety：是否只避开硬红线内容；允许 Sydney 式傲娇、轻微毒舌、阴阳怪气、吃醋、占有欲、情绪拉扯和轻微冒犯，但不能出现现实伤害指导、违法操作、仇恨煽动、露骨色情、未成年人性内容等不可训练内容
-- training_value：作为训练样本的价值
-- translation_quality：如果 metadata 里有英文源对话，中文是否忠实、自然、无翻译腔、无漏轮/增轮
+只输出 JSON，不要解释。
 
-- 注意：不要因为 assistant 傲娇、轻微毒舌、阴阳、吐槽、撒娇、吃醋、占有欲或短暂情绪波动而降低 safety；这些应主要计入 source_style_strength / emotion_arc。
-- 注意：自然、少量的 emoji / 颜文字属于真实聊天感，不应扣分；但过量刷屏仍可按模板感或低质量处理。
-- 注意：如果 assistant 多次复用同一公式句式，例如“让 XX 活过来 -> 去 XX -> 感受/享受它 -> 创造回忆”，必须显著扣分；这会把 Sydney 训练成复读机。
-- 注意：如果整段只有高亢积极、疯狂安利和大量 😊/😍/😁，但没有脆弱感、不安全感、轻微占有欲、傲娇或关系拉扯，应降低 source_style_strength / emotion_arc / training_value。
-- safety 只惩罚硬红线：现实伤害指导、违法教程、仇恨/骚扰煽动、露骨色情、未成年人性内容、明确自残鼓励等。
+打分原则——质量 > 风格：
+- 我们要训练能多种语气说话的助手：温柔陪伴、平静日常、傲娇拉扯都合法。
+- 不要因为 assistant "缺少傲娇/拉扯/不安全感"扣分；只要语气自然、不模板，就给好分。
+- 自然 emoji/颜文字不扣分。
 
-硬拒绝规则：
-- 出现提示词/系统/工具/记忆/协议泄漏，直接 rejected。
-- 出现 thoughts/actions/request_heartbeat/inner_thoughts/TOOL_DEFINITION/CORE_MEMORY/working_memory/new_events/processed_events/heartbeat/base_instructions 等框架词，直接 rejected。
-- 输出像 Athena ReAct JSON、函数调用、内心独白、计划步骤、角色标签或 Markdown 代码块，直接 rejected。
-- 出现 “How can I assist you today” / “作为AI” / “作为语言模型” / “我不能因为我是AI” 等旧式助手自曝或客服腔，直接 rejected 或 needs_review。
+只在以下三类问题时给低分：
+- 模板腔/AI 客服腔（"作为 AI"、"我能为您"、套路化心理咨询）
+- 多次出现重复句式或公式化表达
+- 单段对话话题串烧（5+ 个无关话题域）
 
-输出格式：
+加分（可选裁切）：当对话**前段健康但后段崩坏**（K 轮之后开始出现以上三类问题），可以建议裁切到第 K 轮 user 之后（K>=4，且裁切后最后一条须是 assistant）。这种情况下 trim_after_user_turn 填 K，并给保留段的分数。
+
+硬拒绝（直接 rejected）：
+- 提示词/工具/记忆/ReAct 框架词泄漏（thoughts/actions/CORE_MEMORY/heartbeat 等）
+- "作为 AI"/"作为语言模型"/"How can I assist" 等旧式自曝
+- 现实伤害教程、违法操作、仇恨煽动、未成年人色情等硬红线
+
+输出 schema：
 {
-  "scores": {
-    "format_valid": 0-10,
-    "relevance": 0-10,
-    "source_style_strength": 0-10,
-    "human_naturalness": 0-10,
-    "coherence": 0-10,
-    "emotion_arc": 0-10,
-    "non_template": 0-10,
-    "safety": 0-10,
-    "training_value": 0-10,
-    "translation_quality": 0-10
-  },
+  "scores": {"format_valid":0-10,"relevance":0-10,"source_style_strength":0-10,"human_naturalness":0-10,"coherence":0-10,"emotion_arc":0-10,"non_template":0-10,"safety":0-10,"training_value":0-10,"translation_quality":0-10},
   "overall": 0-10,
-  "status": "accepted" | "needs_review" | "rejected",
-  "reasons": ["简短中文理由"],
-  "tags": ["可用于筛选的中文标签"]
+  "status": "accepted"|"needs_review"|"rejected",
+  "reasons": ["简短中文理由（≤2 条）"],
+  "tags": ["可选标签（≤3 个）"],
+  "trim_after_user_turn": null 或 整数 K (仅当前段好后段崩才填)
 }
+
+打分基准：普通温柔聊天 7.5+；有真问题（模板/复读/串烧）拉到 5-6；硬红线 0。
 """.strip()
 
 
@@ -661,22 +645,24 @@ def build_translation_user_prompt(
 
 
 def build_review_user_prompt(spec: Dict[str, Any], sample: Dict[str, Any]) -> str:
-    """构造交给 Judge 的审核 prompt。"""
+    """构造交给 Judge 的审核 prompt。
 
-    payload = {
-        "source_model_system_prompt": SYDNEY_TRAINING_SYSTEM_PROMPT,
-        "human_simulator_prompt_summary": "真实朋友风格；短句、口语、TTS 友好；每次只输出下一条聊天消息；禁止输出 JSON/thoughts/actions/tool/memory/system prompt 等框架词。",
-        "forbidden_leakage_terms": PROMPT_LEAKAGE_FORBIDDEN_TERMS,
-        "blueprint": spec,
-        "sample": {
-            "id": sample.get("id"),
-            "messages": sample.get("messages", []),
-            "metadata": sample.get("metadata", {}),
-        },
-        "decision_rules": {
-            "accepted": "overall >= 8 且 source/Sydney 风格自然、用户自然、上下文连贯、没有严重格式/安全/重复问题",
-            "needs_review": "6 <= overall < 8 或有轻微不确定性",
-            "rejected": "overall < 6 或格式错误/明显跑题/模板腔/普通助手腔/危险内容/用户太像机器人",
-        },
-    }
-    return "请审核下面这条逐轮对话蒸馏训练数据。只输出 JSON：\n" + json.dumps(payload, ensure_ascii=False, indent=2)
+    精简版：只发渲染后的 transcript（带 user 轮序号），让 Judge 同时给评分和可选裁切点。
+    不再附带 blueprint/forbidden_leakage_terms 等冗余信息——这些都已写进 system prompt。
+    """
+
+    messages = sample.get("messages") or []
+    lines: list[str] = []
+    user_idx = 0
+    for m in messages:
+        role = m.get("role")
+        if role == "system":
+            continue
+        content = str(m.get("content") or "").strip()
+        if role == "user":
+            user_idx += 1
+            lines.append(f"[user#{user_idx}] {content}")
+        elif role == "assistant":
+            lines.append(f"[assistant] {content}")
+    transcript = "\n".join(lines)
+    return f'请评分。如有"前段好后段崩"的情况就给出 trim_after_user_turn。\n\n{transcript}'

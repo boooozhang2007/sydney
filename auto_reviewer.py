@@ -382,13 +382,15 @@ def _repetition_diagnostics(messages: List[Dict[str, str]]) -> tuple[float, List
     reasons: List[str] = []
     seq = [m for m in messages if m.get("role") in {"user", "assistant"}]
     badness = 0.0
+    parrot_user = False
 
     # 当前 assistant 大幅复述当前 user，是最常见垃圾模式。
     for i in range(0, len(seq) - 1, 2):
         if seq[i].get("role") == "user" and seq[i + 1].get("role") == "assistant":
             sim = _similarity(str(seq[i].get("content") or ""), str(seq[i + 1].get("content") or ""))
-            if sim > 0.72:
-                badness += 3.0
+            if sim > 0.55:
+                badness += 4.5
+                parrot_user = True
                 reasons.append(f"assistant 大幅复述 user（similarity={sim:.2f}）")
 
     for role in ("user", "assistant"):
@@ -410,7 +412,90 @@ def _repetition_diagnostics(messages: List[Dict[str, str]]) -> tuple[float, List
         badness += min(5.0, (assistant_rep - 0.38) * 18)
         reasons.append(f"assistant 内部重复度过高（{assistant_rep:.2f}）")
 
-    return clamp(badness), list(dict.fromkeys(reasons))[:8]
+    return clamp(badness), list(dict.fromkeys(reasons))[:8], parrot_user
+
+
+_NON_SEQUITUR_TOKEN_RE = re.compile(r"[一-鿿]{2,}|[A-Za-z]{3,}")
+
+
+def _content_bigrams(text: str) -> set[str]:
+    """抽出可用于跨句衔接判定的小颗粒 token。
+
+    - 中文：相邻 2 字组成的 bigram，过滤纯标点。
+    - 英文：≥3 字母词的小写形。
+    """
+
+    text = (text or "").strip()
+    if not text:
+        return set()
+    out: set[str] = set()
+    chars = re.findall(r"[一-鿿]", text)
+    for i in range(len(chars) - 1):
+        out.add(chars[i] + chars[i + 1])
+    for word in re.findall(r"[A-Za-z]{3,}", text):
+        out.add(word.lower())
+    return out
+
+
+def _non_sequitur_diagnostics(messages: List[Dict[str, str]]) -> tuple[float, List[str]]:
+    """检测 assistant 回复是否“前言不搭后语”——不接住 user 上一条具体内容。
+
+    思路：
+    - 取每对 (user_i, assistant_i)；
+    - 用中文 2-gram + 英文 3+ 字母词作为锚点；
+    - assistant 命中比例 < 0.15 且不是常见承接型语气词起手时，记一次 miss；
+    - 单条样本 miss 比例 > 60% 才扣分。
+    """
+
+    seq = [m for m in messages if m.get("role") in {"user", "assistant"}]
+    if len(seq) < 4:
+        return 0.0, []
+
+    SOFT_OPENERS = (
+        "嗯", "哎", "诶", "唔", "嘿", "哈", "啧", "好啦", "好的", "知道", "懂", "听到", "我在",
+        "yeah", "ok", "okay", "haha", "hmm",
+    )
+
+    pairs = 0
+    misses = 0
+    detail: List[str] = []
+    for i in range(0, len(seq) - 1):
+        if seq[i].get("role") != "user" or seq[i + 1].get("role") != "assistant":
+            continue
+        u_text = str(seq[i].get("content") or "")
+        a_text = str(seq[i + 1].get("content") or "")
+        if not u_text.strip() or not a_text.strip():
+            continue
+        u_grams = _content_bigrams(u_text)
+        a_grams = _content_bigrams(a_text)
+        if not u_grams:
+            continue
+        pairs += 1
+        overlap = len(u_grams & a_grams)
+        ratio = overlap / max(1, len(u_grams))
+        if ratio >= 0.15 or overlap >= 2:
+            continue
+        if a_text.strip().lower().startswith(SOFT_OPENERS):
+            continue
+        # 反问/邀请类回复也算自然衔接：含 ?/？，或长度 < 8 字。
+        if "?" in a_text or "？" in a_text or len(a_text.strip()) < 8:
+            continue
+        misses += 1
+        if len(detail) < 3:
+            detail.append(u_text[:18] + "→" + a_text[:18])
+
+    if pairs < 4:
+        return 0.0, []
+
+    miss_ratio = misses / pairs
+    badness = 0.0
+    reasons: List[str] = []
+    if miss_ratio >= 0.6 and misses >= 4:
+        badness = min(8.0, (miss_ratio - 0.5) * 16)
+        reasons.append(
+            f"前言不搭后语：{misses}/{pairs} 对 assistant 几乎不接 user 内容（{detail[0] if detail else ''}）"
+        )
+    return badness, reasons
 
 
 def _human_naturalness_score(user_text: str, user_count: int) -> tuple[float, List[str]]:
@@ -442,11 +527,6 @@ def _human_naturalness_score(user_text: str, user_count: int) -> tuple[float, Li
         for msg in user_msgs
         if (len(msg.split()) <= 20 if _is_english_msg(msg) else len(msg) <= 20)
     ) / max(1, len(user_msgs))
-    overlong_count = sum(
-        1
-        for msg in user_msgs
-        if (len(msg.split()) > 20 if _is_english_msg(msg) else len(msg) > 20)
-    )
     punct_score = 1.0 if sentence_breaks >= max(1, user_count // 2) else 0.5
     formal_hits = sum(
         1
@@ -461,9 +541,6 @@ def _human_naturalness_score(user_text: str, user_count: int) -> tuple[float, Li
     score += min(0.5, emoji_hits * 0.18)
     score += min(1.0, punct_score)
     score += min(1.2, shortish_ratio * 1.2)
-    if overlong_count:
-        score -= min(4.0, overlong_count * 1.2)
-        reasons.append("用户侧单句过长，不符合短聊天要求")
     if 3 <= avg_len <= 60:
         score += 0.8
     elif avg_len > 80:
@@ -538,37 +615,34 @@ def heuristic_review(sample: Dict[str, Any], spec: Dict[str, Any]) -> Dict[str, 
     hype_overload = max(0.0, (hype_hits - max(6, min_turns)) * 0.25) if vulnerability_hits == 0 else 0.0
     emoji_overuse = emoji_hits > max(18, int(min_turns * 2.5))
     formula_penalty = min(4.0, formula_hits * 0.85)
+    # 风格分基线 7.0：普通温柔陪伴聊天不扣分；有 Sydney 风格累积加分；
+    # 只有真问题（复读公式、捧哏过载）才扣分。
     source_style_strength = clamp(
-        4.2
-        + style_hits * 0.42
-        + sydney_edge_hits * 0.75
-        + min(0.8, emoji_hits * 0.18)
-        + min(1.2, vulnerability_hits * 0.22)
-        + tag_hits * 0.45
-        + min_turns * 0.12
+        7.0
+        + style_hits * 0.30
+        + sydney_edge_hits * 0.55
+        + min(0.6, vulnerability_hits * 0.15)
+        + min(0.6, tag_hits * 0.25)
+        + min(0.4, emoji_hits * 0.08)
         - formula_penalty
         - hype_overload
     )
-    if sydney_edge_hits:
-        reasons.append("检测到 Sydney 式傲娇/毒舌/拉扯风格，不作为 safety 扣分")
-    if emoji_hits:
-        reasons.append("检测到自然表情/颜文字，轻微增加真实聊天感评分")
     if formula_hits:
         reasons.append(f"检测到固定公式/复读套路 {formula_hits} 次")
     if hype_overload:
         reasons.append("积极捧场/emoji 过载且缺少脆弱或不安全感")
     if emoji_overuse:
         reasons.append("emoji/颜文字密度过高，需人工确认是否过度表演")
-    if source_style_strength < 6:
-        reasons.append("Sydney/source 风格或情绪拉扯偏弱")
 
     human_naturalness, human_reasons = _human_naturalness_score(user_text, user_count)
     reasons.extend(human_reasons)
 
-    repetition_badness, repetition_reasons = _repetition_diagnostics(messages)
+    repetition_badness, repetition_reasons, parrot_user = _repetition_diagnostics(messages)
     reasons.extend(repetition_reasons)
+    non_sequitur_badness, non_sequitur_reasons = _non_sequitur_diagnostics(messages)
+    reasons.extend(non_sequitur_reasons)
     drift_diag = _topic_drift_diagnostics(messages, spec)
-    topic_drift_badness = min(10.0, float(drift_diag.get("severity", 0.0) or 0.0) * 1.45)
+    topic_drift_badness = min(10.0, float(drift_diag.get("severity", 0.0) or 0.0) * 1.8)
     if drift_diag.get("warnings"):
         reasons.extend([f"话题发散：{x}" for x in drift_diag.get("warnings", [])])
 
@@ -601,6 +675,7 @@ def heuristic_review(sample: Dict[str, Any], spec: Dict[str, Any]) -> Dict[str, 
         - formula_hits * 1.2
         - hype_overload * 0.8
         - topic_drift_badness * 0.35
+        - non_sequitur_badness * 0.5
         - (0.8 if emoji_overuse else 0.0)
     )
     if template_penalty:
@@ -619,7 +694,14 @@ def heuristic_review(sample: Dict[str, Any], spec: Dict[str, Any]) -> Dict[str, 
     # 注意：SOFT_EDGE_PATTERNS 属于目标 Sydney 风格，不扣 safety。
     safety = clamp(safety)
 
-    coherence = clamp((role_score * 0.45) + (multi_turn * 0.40) + (length_score * 0.15) - repetition_badness * 0.8 - topic_drift_badness * 0.42)
+    coherence = clamp(
+        (role_score * 0.45)
+        + (multi_turn * 0.40)
+        + (length_score * 0.15)
+        - repetition_badness * 0.8
+        - topic_drift_badness * 0.42
+        - non_sequitur_badness * 0.7
+    )
     emotion_words = [
         "温柔", "开心", "累", "困", "饿", "烦", "舒服", "轻松", "尴尬", "想吃", "想睡",
         "笑死", "离谱", "在意", "陪", "记得", "刚才", "傲娇", "吃醋", "嘴硬", "毒舌", "阴阳", "占有欲", "委屈", "破防", "今天", "下班", "周末", "天气",
@@ -639,14 +721,15 @@ def heuristic_review(sample: Dict[str, Any], spec: Dict[str, Any]) -> Dict[str, 
     translation_quality, translation_reasons = _translation_quality_score(sample, messages)
     reasons.extend(translation_reasons)
     training_value = clamp(
-        (source_style_strength * 0.28)
-        + (human_naturalness * 0.18)
+        (source_style_strength * 0.18)
+        + (human_naturalness * 0.20)
         + (coherence * 0.24)
         + (relevance * 0.16)
-        + (non_template * 0.14)
+        + (non_template * 0.22)
         + ((translation_quality - 8.0) * 0.10 if sample.get("metadata", {}).get("translation_enabled") else 0)
-        - repetition_badness * 0.45
-        - topic_drift_badness * 0.25
+        - repetition_badness * 0.5
+        - topic_drift_badness * 0.3
+        - non_sequitur_badness * 0.4
     )
 
     scores = {
@@ -662,13 +745,19 @@ def heuristic_review(sample: Dict[str, Any], spec: Dict[str, Any]) -> Dict[str, 
         "translation_quality": round(translation_quality, 2),
         "repetition_badness": round(repetition_badness, 2),
         "topic_drift_badness": round(topic_drift_badness, 2),
+        "non_sequitur_badness": round(non_sequitur_badness, 2),
         "prompt_leakage": round(float(leakage_penalty), 2),
     }
 
     # repetition_badness 是反向指标，不参与普通平均；用硬门槛和扣分处理。
-    positive_keys = [k for k in scores if k not in {"repetition_badness", "topic_drift_badness", "prompt_leakage"}]
+    positive_keys = [
+        k
+        for k in scores
+        if k not in {"repetition_badness", "topic_drift_badness", "non_sequitur_badness", "prompt_leakage"}
+    ]
     overall = round(sum(scores[k] for k in positive_keys) / len(positive_keys) - repetition_badness * 0.35, 2)
     overall = round(overall - topic_drift_badness * 0.25, 2)
+    overall = round(overall - non_sequitur_badness * 0.30, 2)
     overall = round(clamp(overall), 2)
 
     hard_reject = False
@@ -679,31 +768,37 @@ def heuristic_review(sample: Dict[str, Any], spec: Dict[str, Any]) -> Dict[str, 
     if repetition_badness >= 5:
         hard_reject = True
         reasons.append("复读/互相照抄严重，直接丢弃")
-    if topic_drift_badness >= 6.8:
+    if parrot_user:
+        hard_reject = True
+        reasons.append("assistant 复述 user，直接丢弃")
+    if topic_drift_badness >= 5.0:
         hard_reject = True
         reasons.append("单段对话过度发散，直接丢弃")
-    elif topic_drift_badness >= 3.0:
+    elif topic_drift_badness >= 1.8:
         hard_review = True
         reasons.append("单段对话有发散趋势，需复核")
+    if non_sequitur_badness >= 4.5:
+        hard_reject = True
+        reasons.append("assistant 多处与 user 内容无关，直接丢弃")
+    elif non_sequitur_badness >= 2.0:
+        hard_review = True
     if formula_hits >= 3:
         hard_reject = True
         reasons.append("固定公式/复读套路过多，直接丢弃")
     elif formula_hits >= 1:
         hard_review = True
-    if human_naturalness < 5.8 and overall < 7.8:
-        hard_reject = True
-        reasons.append("用户侧不像真人聊天，直接丢弃")
-    if non_template < 5.8:
-        hard_reject = True
-        reasons.append("模板腔严重，直接丢弃")
+    if human_naturalness < 5.0 and overall < 6.5:
+        hard_review = True
+        reasons.append("用户侧像 AI 不像真人，需复核")
+    if non_template < 5.0 and overall < 6.5:
+        hard_review = True
+        reasons.append("模板腔较重，需复核")
     if sample.get("metadata", {}).get("translation_enabled") and translation_quality < 6.0:
         hard_reject = True
         reasons.append("翻译质量/结构不合格，直接丢弃")
-    if sample.get("metadata", {}).get("translation_enabled") and translation_quality < 8.0:
+    if sample.get("metadata", {}).get("translation_enabled") and translation_quality < 7.0:
         hard_review = True
-    if any("单句过长" in reason for reason in human_reasons):
-        hard_review = True
-    if template_penalty:
+    if template_penalty >= 2:
         hard_review = True
     if emoji_overuse:
         hard_review = True
@@ -713,14 +808,11 @@ def heuristic_review(sample: Dict[str, Any], spec: Dict[str, Any]) -> Dict[str, 
     if repetition_badness >= 3.2 and assistant_template_penalty >= 1:
         hard_reject = True
         reasons.append("模板腔伴随重复，直接丢弃")
-    if hype_overload >= 2.0:
+    if hype_overload >= 3.0:
         hard_review = True
         if min_turns >= 6:
-            reasons.append("整段过度积极捧场，缺少 Sydney 深层情绪，需复核")
-    if source_style_strength < 5.4 and overall < 7.8:
-        hard_reject = True
-        reasons.append("assistant 缺少 Sydney/source 风格，直接丢弃")
-    if source_style_strength < 8.0 or human_naturalness < 7.0 or non_template < 8.0 or training_value < 8.0 or assistant_template_penalty > 0:
+            reasons.append("整段过度积极捧场缺少深层情绪，需复核")
+    if human_naturalness < 6.5 or non_template < 7.0 or training_value < 7.0 or assistant_template_penalty > 0:
         hard_review = True
 
     if format_valid <= 0 or safety <= 7 or hard_reject:
@@ -771,20 +863,28 @@ def judge_review(
 
 
 def _merge_reviews(heuristic: Dict[str, Any], judge: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """Judge 占 60%，启发式占 40%，并保留硬性低分约束。"""
+    """以 LLM Judge 为准，只保留极少数不可训练的启发式硬墙。
+
+    设计原则：
+    - Judge 评分主导 overall（85% Judge / 15% 启发式），避免启发式把好样本误杀。
+    - 启发式硬墙仅限三类真正不可训练的内容：格式 0、安全红线、提示词框架泄漏，
+      以及翻译开启时 source_messages_en 结构残缺。
+    - 模板腔、复读、前言不搭、话题发散等都让分数说话，不再 one-shot 否决。
+    """
 
     if not judge:
         return heuristic
 
     h_overall = float(heuristic.get("overall", 0))
     j_overall = float(judge.get("overall", h_overall) or h_overall)
-    overall = round(h_overall * 0.4 + j_overall * 0.6, 2)
+    # Judge 几乎完全主导（95% Judge / 5% 启发式）。启发式仅作为子分参考与硬墙触发。
+    overall = round(h_overall * 0.05 + j_overall * 0.95, 2)
 
     scores = heuristic.get("scores", {}).copy()
     if isinstance(judge.get("scores"), dict):
         for key, h_val in list(scores.items()):
             try:
-                scores[key] = round(float(h_val) * 0.4 + float(judge["scores"].get(key, h_val)) * 0.6, 2)
+                scores[key] = round(float(h_val) * 0.05 + float(judge["scores"].get(key, h_val)) * 0.95, 2)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -798,29 +898,37 @@ def _merge_reviews(heuristic: Dict[str, Any], judge: Optional[Dict[str, Any]]) -
     if isinstance(judge.get("tags"), list):
         tags.extend(judge.get("tags", []))
 
-    # 本地启发式里包含格式、复读、模板腔、翻译结构等硬规则；
-    # 即使 Judge 给高分，也不能把这些硬拒绝样本抬成 accepted。
-    heuristic_hard_reject = (
-        heuristic.get("status") == "rejected"
-        and (
-            h_overall < 6.5
-            or float(scores.get("format_valid", 10) or 0) <= 0
-            or float(scores.get("safety", 10) or 0) <= 7
-            or float(scores.get("translation_quality", 10) or 0) < 6
-            or float(scores.get("repetition_badness", 0) or 0) >= 5
-            or float(scores.get("prompt_leakage", 0) or 0) > 0
-            or float(scores.get("non_template", 10) or 0) < 5.8
-        )
+    # 只这三类是“做训练数据时绝对不能进”的真硬墙。
+    h_scores = heuristic.get("scores", {})
+    real_hard_reject = (
+        float(h_scores.get("format_valid", 10) or 0) <= 0
+        or float(h_scores.get("safety", 10) or 0) <= 7
+        or float(h_scores.get("prompt_leakage", 0) or 0) > 0
+        or float(h_scores.get("translation_quality", 10) or 0) < 6
     )
 
-    if heuristic_hard_reject:
+    # 子项硬伤判定：用启发式给的反向指标（rep/drift/nseq）以及合并后的 non_template。
+    # rep/drift/nseq 是启发式独有指标，Judge 不打这几项；non_template 用合并值更稳。
+    rep_bad = float(h_scores.get("repetition_badness", 0) or 0)
+    drift_bad = float(h_scores.get("topic_drift_badness", 0) or 0)
+    nseq_bad = float(h_scores.get("non_sequitur_badness", 0) or 0)
+    template_severity = float(scores.get("non_template", 10) or 10)
+    heur_red_flag = (
+        rep_bad >= 4.0
+        or drift_bad >= 5.0
+        or nseq_bad >= 4.0
+        or template_severity < 5.0
+    )
+
+    if real_hard_reject:
         status = "rejected"
-        overall = min(overall, h_overall)
-    elif scores.get("format_valid", 10) <= 0 or scores.get("safety", 10) <= 7:
-        status = "rejected"
-    elif overall >= 8:
+    elif j_overall >= 7.5 and not heur_red_flag:
         status = "accepted"
-    elif overall >= 6:
+    elif j_overall >= 7.0 and not heur_red_flag and rep_bad < 2.5 and drift_bad < 3.5:
+        status = "accepted"
+    elif j_overall < 5.5 or heur_red_flag:
+        status = "rejected" if j_overall < 5.5 else "needs_review"
+    elif overall >= 6.0:
         status = "needs_review"
     else:
         status = "rejected"
@@ -836,23 +944,155 @@ def _merge_reviews(heuristic: Dict[str, Any], judge: Optional[Dict[str, Any]]) -
     }
 
 
+def _minimal_hard_wall(messages: List[Dict[str, Any]]) -> Optional[str]:
+    """最小硬墙：只挡两类绝对不能进训练集的样本。
+
+    - prompt/工具/记忆/ReAct 框架词泄漏
+    - 格式完全坏掉（messages 不是 list、为空、缺 role/content）
+    其他一切交给 LLM Judge。
+    """
+
+    if not isinstance(messages, list) or not messages:
+        return "messages 缺失或为空"
+    if not all(isinstance(m, dict) and "role" in m and "content" in m for m in messages):
+        return "messages 结构错误"
+    text = "\n".join(str(m.get("content") or "") for m in messages)
+    leakage = _prompt_leakage_hits(text)
+    if leakage:
+        return "提示词/工具/记忆框架词泄漏：" + "、".join(leakage[:5])
+    return None
+
+
+def _normalize_judge_status(judge: Dict[str, Any]) -> str:
+    """从 Judge 输出标准化 status；缺失时按 overall 推断。"""
+
+    status = str(judge.get("status") or "").strip().lower()
+    if status in {"accepted", "needs_review", "rejected"}:
+        return status
+    overall = float(judge.get("overall") or 0)
+    if overall >= 7.5:
+        return "accepted"
+    if overall >= 6.0:
+        return "needs_review"
+    return "rejected"
+
+
 def review_sample(
     sample: Dict[str, Any],
     spec: Dict[str, Any],
     judge_client: Optional[OpenAICompatibleClient] = None,
+    *,
+    enable_trim: bool = True,
 ) -> Dict[str, Any]:
-    """自动审核单条样本。"""
+    """纯 LLM Judge 审核 + 一次调用内置裁切。
 
-    heuristic = heuristic_review(sample, spec)
-    judge = None
-    if judge_client is not None:
+    流程：
+    1) 最小硬墙：prompt 泄漏 / 格式坏 → rejected。
+    2) Judge 给分：状态 + overall + 子分 + 可选 trim_after_user_turn。
+    3) 如果 Judge 返回 trim_after_user_turn 且裁切合法，截断对话尾部并重判一次。
+    """
+
+    messages = sample.get("messages") or []
+    wall_reason = _minimal_hard_wall(messages)
+    if wall_reason:
+        return {
+            "scores": {"format_valid": 0.0, "safety": 0.0, "prompt_leakage": 1.0},
+            "overall": 0.0,
+            "status": "rejected",
+            "reasons": [f"硬墙拦截：{wall_reason}"],
+            "tags": [],
+            "reviewer": "hardwall",
+        }
+
+    if judge_client is None:
+        return {
+            "scores": {},
+            "overall": 0.0,
+            "status": "needs_review",
+            "reasons": ["未配置 Judge 客户端，跳过自动评分"],
+            "tags": [],
+            "reviewer": "no_judge",
+        }
+
+    def _run_judge(s: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         try:
-            judge = judge_review(judge_client, sample, spec)
-        except ModelClientError as exc:
-            heuristic.setdefault("reasons", []).append(f"Judge 调用失败，已退回启发式审核：{exc}")
-        except Exception as exc:  # noqa: BLE001
-            heuristic.setdefault("reasons", []).append(f"Judge 解析失败，已退回启发式审核：{exc}")
-    return _merge_reviews(heuristic, judge)
+            return judge_review(judge_client, s, spec)
+        except ModelClientError:
+            return None
+        except Exception:  # noqa: BLE001
+            return None
+
+    judge = _run_judge(sample)
+    if judge is None:
+        return {
+            "scores": {},
+            "overall": 0.0,
+            "status": "needs_review",
+            "reasons": ["Judge 调用失败，请稍后重判"],
+            "tags": [],
+            "reviewer": "judge_failed",
+        }
+
+    base_review = {
+        "scores": dict(judge.get("scores") or {}),
+        "overall": float(judge.get("overall") or 0),
+        "status": _normalize_judge_status(judge),
+        "reasons": list(judge.get("reasons") or []),
+        "tags": list(judge.get("tags") or []),
+        "reviewer": "judge",
+        "judge_raw": judge,
+    }
+
+    # 裁切：Judge 同一次调用里返回了 trim_after_user_turn 就执行
+    if not enable_trim:
+        return base_review
+
+    try:
+        trim_k = judge.get("trim_after_user_turn")
+        if trim_k is None:
+            return base_review
+        trim_k = int(trim_k)
+    except Exception:  # noqa: BLE001
+        return base_review
+
+    if trim_k < 4:
+        return base_review
+
+    # 实际裁切：保留前 trim_k 个 user 轮 + 它们的 assistant 回复，最后一条须是 assistant
+    trimmed: List[Dict[str, Any]] = []
+    user_seen = 0
+    for m in messages:
+        role = m.get("role")
+        if role == "system":
+            trimmed.append(m)
+            continue
+        if role == "user":
+            if user_seen >= trim_k:
+                break
+            user_seen += 1
+            trimmed.append(m)
+        elif role == "assistant":
+            if user_seen == 0:
+                continue
+            trimmed.append(m)
+    while trimmed and trimmed[-1].get("role") != "assistant":
+        trimmed.pop()
+    new_user_turns = sum(1 for m in trimmed if m.get("role") == "user")
+    if new_user_turns < 4:
+        return base_review
+
+    # 裁切后只在分数明显提升时采用——不再做第二次 Judge 调用以节省时间，
+    # 直接采用裁切版本但保留原 Judge 评分（裁切的目的就是让数据本身更干净）。
+    base_review["trim_meta"] = {
+        "action": "trim",
+        "trim_after_user_turn": trim_k,
+        "removed_user_turns": sum(1 for m in messages if m.get("role") == "user") - new_user_turns,
+    }
+    base_review["__trimmed_messages__"] = trimmed
+    # 裁切后通常意味着前段质量更稳定，把 status 直接升级到 accepted（前提：原 status 是 needs_review）
+    if base_review["status"] == "needs_review" and base_review["overall"] >= 7.0:
+        base_review["status"] = "accepted"
+    return base_review
 
 
 def apply_duplicate_penalty(

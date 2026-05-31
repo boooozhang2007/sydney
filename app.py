@@ -1004,6 +1004,11 @@ def generate_and_review_one(
         pool_connections=generation_pool_connections,
     )
     review = review_sample(sample, spec, judge_client=judge_client)
+    trimmed = review.pop("__trimmed_messages__", None)
+    if trimmed:
+        sample["messages"] = trimmed
+        text = conversation_text(trimmed)
+        job_log(job_id, f"裁切对话尾部，保留前段；trim={review.get('trim_meta', {})}", item=idx)
     job_log(
         job_id,
         f"审核完成：status={review.get('status')} overall={float(review.get('overall', 0) or 0):.2f}",
@@ -1130,6 +1135,11 @@ def run_generation_job(
             pool_connections=max(translation_workers, req.concurrency, 16),
         )
         review = review_sample(translated, spec, judge_client=judge_client)
+        trimmed = review.pop("__trimmed_messages__", None)
+        if trimmed:
+            translated["messages"] = trimmed
+            text = conversation_text(trimmed)
+            job_log(job_id, f"裁切对话尾部，保留前段；trim={review.get('trim_meta', {})}", item=idx)
         job_log(
             job_id,
             f"审核完成：status={review.get('status')} overall={float(review.get('overall', 0) or 0):.2f}",
